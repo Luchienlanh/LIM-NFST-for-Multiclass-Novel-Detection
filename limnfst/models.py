@@ -41,7 +41,7 @@ class LIM_NFST:
         base_points = np.vstack([Y_train[y == cls].mean(axis=0) for cls in self.classes_])
         D_train = dist_to_basepoints(Y_train, base_points)
         train_scores = novelty_score(D_train)
-        threshold = get_threshold(base_points)
+        threshold = get_threshold(train_scores)
         train_closed_pred = self.classes_[nearest_idx(D_train)]
         
         self.X_train_norm_ = X_train_norm
@@ -81,7 +81,7 @@ class LIM_NFST:
             "theta_shape": [int(dim) for dim in self.theta_.shape],
             "projection_shape": [int(dim) for dim in self.projection_matrix_.shape],
             "base_points_shape": [int(dim) for dim in self.base_points_.shape],
-            "threshold_rule": "0.5 * min_{i != j} ||base_i - base_j||_2",
+            "threshold_rule": "95th percentile of train novelty scores",
             "threshold": float(self.threshold_),
             "min_basepoint_distance": min_base_dist,
             "train_score_min": float(np.min(self.train_scores_)) if len(self.train_scores_) else None,
