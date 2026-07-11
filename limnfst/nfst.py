@@ -130,37 +130,37 @@ def _projected_between_scatter(Z, y):
     return scatter
 
 
-# def get_project(Q_w, X_norm, y, eps, n_components=None):
-#     if n_components is None:
-#         n_components = Q_w.shape[1]
-#     n_components = min(n_components, Q_w.shape[1])
+def get_project(Q_w, X_norm, y, eps, n_components=None):
+    if n_components is None:
+        n_components = Q_w.shape[1]
+    n_components = min(n_components, Q_w.shape[1])
     
-#     if n_components == 0:
-#         return np.empty((Q_w.shape[0], 0))
+    if n_components == 0:
+        return np.empty((Q_w.shape[0], 0))
 
-#     E_w = _psi_eps_times(X_norm, Q_w, eps)
-#     S_b_prj = _projected_between_scatter(E_w, y)
-#     S_b_prj = (S_b_prj + S_b_prj.T) / 2.0
+    E_w = _psi_eps_times(X_norm, Q_w, eps)
+    S_b_prj = _projected_between_scatter(E_w, y)
+    S_b_prj = (S_b_prj + S_b_prj.T) / 2.0
     
-#     eigvals, eigvecs = np.linalg.eigh(S_b_prj)
+    eigvals, eigvecs = np.linalg.eigh(S_b_prj)
     
-#     idx = np.argsort(eigvals)[::-1]
-#     top_idx = idx[:n_components]
+    idx = np.argsort(eigvals)[::-1]
+    top_idx = idx[:n_components]
     
-#     V = eigvecs[:, top_idx]
-#     L = eigvals[top_idx]
+    V = eigvecs[:, top_idx]
+    L = eigvals[top_idx]
     
-#     # 4. WHITENING: Đây là chìa khóa để cách đều
-#     # A = V * (1 / sqrt(L))
-#     A = V @ np.diag(1.0 / np.sqrt(L + 1e-12)) # Thêm eps nhỏ để tránh chia cho 0
+    # 4. WHITENING: Đây là chìa khóa để cách đều
+    # A = V * (1 / sqrt(L))
+    A = V @ np.diag(1.0 / np.sqrt(L + 1e-12)) # Thêm eps nhỏ để tránh chia cho 0
     
-#     theta_mtrx = Q_w @ A
-#     # idx = np.argsort(eigvals)[::-1]
-#     # A = eigvecs[:, idx[:n_components]]
+    theta_mtrx = Q_w @ A
+    # idx = np.argsort(eigvals)[::-1]
+    # A = eigvecs[:, idx[:n_components]]
     
-#     # theta_mtrx = Q_w @ A
+    # theta_mtrx = Q_w @ A
     
-#     return theta_mtrx
+    return theta_mtrx
 
 def get_project(Q_w, R, y, dist=1.0):
     classes = np.unique(y)
