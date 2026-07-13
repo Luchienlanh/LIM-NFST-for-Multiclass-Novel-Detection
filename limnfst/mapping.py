@@ -1,21 +1,25 @@
+"""Pearson sample mapping used by the revised LIM-NFST paper."""
+
+from __future__ import annotations
+
 import numpy as np
 
 
 def center_normalize(X):
-    X_mean = np.mean(X, axis=1, keepdims=True)
-    X_centered = X - X_mean
-    norm = np.linalg.norm(X_centered, axis=1, keepdims=True)
-    norm[norm == 0] = 1e-10
-    X_norm = X_centered / norm
-    return X_norm
+    """Center and L2-normalize every sample (paper Eq. 20).
 
-# def get_Psi(X, epsilon=1e-4):
-#     X_normalize = center_normalize(X)
-    
-#     Psi = X_normalize @ X_normalize.T
-    
-#     I = np.eye(Psi.shape[0])
-    
-#     Psi_eps = Psi + epsilon * I
-#     return Psi_eps 
-    
+    The repository represents samples by rows, whereas the paper represents
+    them by columns. Consequently, centering is performed across features
+    (``axis=1``) independently for each sample.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError("X must be a 2-D array with samples in rows")
+
+    centered = X - X.mean(axis=1, keepdims=True)
+    norms = np.linalg.norm(centered, axis=1, keepdims=True)
+    if np.any(norms == 0):
+        raise ValueError(
+            "Pearson mapping is undefined for a sample whose features are all equal"
+        )
+    return centered / norms
