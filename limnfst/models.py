@@ -1,153 +1,217 @@
+"""Paper-faithful revised LIM-NFST estimator."""
+
 from __future__ import annotations
+
 import numpy as np
+
 from limnfst.mapping import center_normalize
-from limnfst.novelty import *
-from limnfst.nfst import *
+from limnfst.nfst import (
+    align_to_simplex,
+    get_Q_w,
+    get_project,
+    psi_eps_times,
+)
+from limnfst.novelty import (
+    dist_to_basepoints,
+    get_threshold,
+    nearest_idx,
+    novelty_mask,
+)
+
 
 class LIM_NFST:
-    def __init__(
-        self,
-        eps=1e-4,
-        novel_label=-1,
-        subspace="qw",
-        beta=3.0,
-    ):
+    """Algorithms 1-2 from the revised LIM-NFST paper.
+
+    ``eps`` stabilizes only the training Woodbury system and ``delta`` is the
+    prescribed edge length of the regular simplex in Section 4.3.
+    """
+
+    def __init__(self, eps=1e-4, delta=2.0, novel_label=-1, subspace="qw"):
         if subspace != "qw":
-            raise ValueError("The implicit LIM-NFST implementation only supports subspace='qw'")
-        self.eps = eps
+            raise ValueError("the paper algorithm only defines subspace='qw'")
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+        if not np.isfinite(delta) or delta <= 0:
+            raise ValueError("delta must be a finite positive edge length")
+
+        self.eps = float(eps)
+        self.delta = float(delta)
         self.novel_label = novel_label
         self.subspace = subspace
-        self.beta = beta
-        self.X_train_: np.ndarray | None = None
-        self.classes_: np.ndarray | None = None
-        self.theta_: np.ndarray | None = None
-        self.projection_matrix_: np.ndarray | None = None
-        self.threshold_: np.ndarray | float = 0
-        
+        self.projection_matrix_ = None
+
     def fit(self, X, y, collect_diagnostics=False):
         X = np.ascontiguousarray(X, dtype=np.float64)
         y = np.asarray(y)
+        if X.ndim != 2 or len(X) != len(y):
+            raise ValueError("X must be 2-D with one row per label")
+        if not np.all(np.isfinite(X)):
+            raise ValueError("X contains NaN or infinite values")
+
+        classes = np.unique(y)
+        if len(classes) < 2:
+            raise ValueError("LIM-NFST requires at least two known classes")
+
+        # Algorithm 1, step 1: Pearson sample normalization.
+        X_norm = center_normalize(X)
+
+        # Steps 2-3: Woodbury Q, removal of the trivial direction, then QR.
+        Q_w, R = get_Q_w(X_norm, y, self.eps)
+
+        # Steps 4-6: positive EVD directions produce Theta_init.
+        theta_init, eigenvalues = get_project(
+            Q_w,
+            R,
+            y,
+            n_components=len(classes) - 1,
+            return_eigenvalues=True,
+        )
+
+        # Steps 7-11: map initial centroids to a regular simplex of edge delta.
+        theta, target_base_points, initial_centroids, alignment = align_to_simplex(
+            theta_init,
+            X_norm,
+            y,
+            self.eps,
+            self.delta,
+        )
+
+        # For unseen x, Algorithm 2 uses Psi_test Theta. This is exactly
+        # x_norm @ (X_train_norm.T @ Theta); no eps I term exists at test time.
+        projection_matrix = X_norm.T @ theta
+
+        # Training centroids are defined in the regularized training system.
+        # They are computed only as a diagnostic; Algorithm 1 step 11 fixes the
+        # actual base points to the target simplex vertices t_j.
+        Y_train = psi_eps_times(X_norm, theta, self.eps)
+        empirical_centroids = np.vstack(
+            [Y_train[y == cls].mean(axis=0) for cls in classes]
+        )
+        base_points = target_base_points
+
+        distances = dist_to_basepoints(Y_train, base_points)
+        train_nearest = nearest_idx(distances)
+        train_closed_pred = classes[train_nearest]
+        train_scores = np.min(distances, axis=1)
+        threshold = get_threshold(self.delta)
+
         self.X_train_ = X
-        self.classes_ = np.unique(y)
-        
-        X_train_norm = center_normalize(X)
-        
-        Q_w, R_w = get_Q_w(X_train_norm, y, self.eps)
-        if Q_w.shape[1] == 0:
-            raise ValueError("Woodbury null subspace is empty")
-        
-        # n_components = min(len(self.classes_) - 1, Q_w.shape[1])
-        # theta_matrix = get_project(Q_w, X_train_norm, y, self.eps, n_components=n_components)
-        theta_matrix = get_project(Q_w, R_w, y, dist=2.0)
-        projection_matrix = X_train_norm.T @ theta_matrix
-        
-                # --- PHƯƠNG PHÁP 1: Z-SCORE SCALING ---
-        projection_matrix = X_train_norm.T @ theta_matrix
-        
-        # 1. Chiếu thử tập train (unregularized) để tính toán độ lệch chuẩn của từng chiều con
-        Y_train_raw = X_train_norm @ projection_matrix
-        
-        # 2. Tính độ lệch chuẩn từng chiều (std của từng cột)
-        dim_std = np.std(Y_train_raw, axis=0)
-        # Tránh chia cho 0 (nếu có chiều nào đó biến động bằng 0, ta đặt std = 1.0)
-        dim_std = np.where(dim_std > 0, dim_std, 1.0)
-        
-        # 3. Scale ma trận chiếu bằng cách chia cho độ lệch chuẩn
-        # (Phép chia này hoàn toàn TUYẾN TÍNH vì chia cho hằng số)
-        projection_matrix_scaled = projection_matrix / dim_std
-        
-        # 4. Sử dụng ma trận chiếu đã scale để tính base points và các tọa độ huấn luyện mới
-        Y_train = X_train_norm @ projection_matrix_scaled + self.eps * (theta_matrix / dim_std)
-        base_points = np.vstack([Y_train[y == cls].mean(axis=0) for cls in self.classes_])
-        
-        # Lưu các giá trị đã scale vào thuộc tính của lớp
-        self.projection_matrix_ = projection_matrix_scaled
-        
-        # Y_train = X_train_norm @ projection_matrix + self.eps * theta_matrix
-        # base_points = np.vstack([Y_train[y == cls].mean(axis=0) for cls in self.classes_])
-        
-        # Calculate threshold based on variance of test-like projections
-        Y_train_trans = X_train_norm @ projection_matrix
-        D_train_trans = dist_to_basepoints(Y_train_trans, base_points)
-        train_scores_trans = novelty_score(D_train_trans)
-        
-        D_train = dist_to_basepoints(Y_train, base_points)
-        train_scores = novelty_score(D_train)
-        train_nearest_idx = nearest_idx(D_train)
-        threshold = get_threshold(train_scores_trans, beta=self.beta)
-        train_closed_pred = self.classes_[train_nearest_idx]
-        
-        self.X_train_norm_ = X_train_norm
-        self.theta_ = theta_matrix
+        self.X_train_norm_ = X_norm
+        self.y_train_ = y
+        self.y_fit_ = y
+        self.classes_ = classes
+        self.Q_w_ = Q_w
+        self.R_w_ = R
+        self.theta_init_ = theta_init
+        self.theta_ = theta
+        self.between_eigenvalues_ = eigenvalues
+        self.initial_centroids_ = initial_centroids
+        self.alignment_matrix_ = alignment
         self.projection_matrix_ = projection_matrix
         self.base_points_ = base_points
+        self.empirical_base_points_ = empirical_centroids
         self.Y_train_ = Y_train
         self.train_scores_ = train_scores
-        self.train_nearest_idx_ = train_nearest_idx
+        self.train_nearest_idx_ = train_nearest
         self.train_closed_pred_ = train_closed_pred
-        self.threshold_ = threshold
+        self.threshold_ = float(threshold)
+        self.n_features_in_ = X.shape[1]
         self.subspace_shape_ = Q_w.shape
-        self.classes_ = np.unique(y)
-        self.diagnostics_ = self._build_diagnostics(X_train_norm, y, Q_w, R_w) if collect_diagnostics else None
-        
+        self.diagnostics_ = self._build_diagnostics() if collect_diagnostics else None
         return self
 
-    def _build_diagnostics(self, X_norm, y, Q_w, R_w):
-        classes, counts = np.unique(y, return_counts=True)
-        if len(self.base_points_) > 1:
-            base_dist = dist_to_basepoints(self.base_points_, self.base_points_)
-            np.fill_diagonal(base_dist, np.inf)
-            min_base_dist = float(np.min(base_dist))
-        else:
-            min_base_dist = None
-        threshold = np.asarray(self.threshold_, dtype=np.float64)
-        if threshold.ndim == 0:
-            threshold_values = [float(threshold)]
-        else:
-            threshold_values = [float(value) for value in threshold]
+    def _build_diagnostics(self):
+        c = len(self.classes_)
+        edge_squared = dist_to_basepoints(self.base_points_, self.base_points_)
+        off_diagonal = edge_squared[~np.eye(c, dtype=bool)]
+        centroid_error = np.linalg.norm(
+            self.empirical_base_points_ - self.base_points_, axis=1
+        )
 
+        projected_within = np.zeros(
+            (c - 1, c - 1), dtype=np.float64
+        )
+        for class_index, cls in enumerate(self.classes_):
+            residual = self.Y_train_[self.y_fit_ == cls] - self.base_points_[class_index]
+            projected_within += residual.T @ residual
+
+        train_accuracy = float(
+            np.mean(self.train_closed_pred_ == self.y_fit_) * 100
+        )
+        _, counts = np.unique(self.y_fit_, return_counts=True)
         return {
-            "algorithm": "lim-nfst-implicit",
+            "algorithm": "lim-nfst-revised-paper-algorithm-1-2",
             "subspace": self.subspace,
-            "n_train": int(X_norm.shape[0]),
-            "n_features": int(X_norm.shape[1]),
-            "n_classes": int(len(classes)),
-            "class_counts": {str(cls): int(count) for cls, count in zip(classes, counts)},
-            "eps": float(self.eps),
+            "n_train": int(len(self.y_fit_)),
+            "n_features": int(self.n_features_in_),
+            "n_classes": int(c),
+            "class_counts": {
+                str(cls): int(count)
+                for cls, count in zip(self.classes_, counts)
+            },
+            "eps": self.eps,
+            "delta": self.delta,
             "basis_label": "Q_w",
-            "basis_shape": [int(dim) for dim in Q_w.shape],
-            "qr_r_shape": [int(dim) for dim in R_w.shape],
-            "theta_shape": [int(dim) for dim in self.theta_.shape],
-            "projection_shape": [int(dim) for dim in self.projection_matrix_.shape],
-            "base_points_shape": [int(dim) for dim in self.base_points_.shape],
-            "threshold_rule": f"variance-based threshold: mean + {self.beta} * std",
-            "threshold": threshold_values,
-            "threshold_min": float(np.min(threshold)) if threshold.size else None,
-            "threshold_mean": float(np.mean(threshold)) if threshold.size else None,
-            "threshold_max": float(np.max(threshold)) if threshold.size else None,
-            "min_basepoint_distance": min_base_dist,
-            "train_score_min": float(np.min(self.train_scores_)) if len(self.train_scores_) else None,
-            "train_score_mean": float(np.mean(self.train_scores_)) if len(self.train_scores_) else None,
-            "train_score_max": float(np.max(self.train_scores_)) if len(self.train_scores_) else None,
+            "basis_shape": list(map(int, self.Q_w_.shape)),
+            "qr_r_shape": list(map(int, self.R_w_.shape)),
+            "theta_init_shape": list(map(int, self.theta_init_.shape)),
+            "theta_shape": list(map(int, self.theta_.shape)),
+            "projection_shape": list(map(int, self.projection_matrix_.shape)),
+            "base_points_shape": list(map(int, self.base_points_.shape)),
+            "between_eigenvalues": self.between_eigenvalues_.astype(float).tolist(),
+            "threshold_rule": "Algorithm 2: squared distance > 0.25 * delta^2",
+            "threshold": self.threshold_,
+            "threshold_min": self.threshold_,
+            "threshold_mean": self.threshold_,
+            "threshold_max": self.threshold_,
+            "min_basepoint_distance": float(np.sqrt(np.min(off_diagonal))),
+            "min_basepoint_squared_distance": float(np.min(off_diagonal)),
+            "max_basepoint_edge_error": float(
+                np.max(np.abs(np.sqrt(off_diagonal) - self.delta))
+            ),
+            "max_centroid_alignment_error": float(np.max(centroid_error)),
+            "train_score_min": float(np.min(self.train_scores_)),
+            "train_score_mean": float(np.mean(self.train_scores_)),
+            "train_score_max": float(np.max(self.train_scores_)),
+            "train_closed_set_accuracy": train_accuracy,
+            "projected_within_scatter_fro": float(
+                np.linalg.norm(projected_within, ord="fro")
+            ),
+            "max_train_to_own_base_distance": float(
+                np.sqrt(np.max(self.train_scores_))
+            ),
+            "paper_invariants": {
+                "dimension_is_c_minus_1": bool(self.theta_.shape[1] == c - 1),
+                "simplex_is_centered": bool(
+                    np.allclose(self.base_points_.mean(axis=0), 0.0, atol=1e-9)
+                ),
+                "all_simplex_edges_equal_delta": bool(
+                    np.allclose(off_diagonal, self.delta**2, rtol=1e-8, atol=1e-10)
+                ),
+                "threshold_is_quarter_delta_squared": bool(
+                    np.isclose(self.threshold_, 0.25 * self.delta**2)
+                ),
+            },
         }
-    
+
     def transform(self, X):
-        X_test = center_normalize(X)
-        Y_test = X_test @ self.projection_matrix_
-        return Y_test       
-        
+        """Algorithm 2 steps 1-2; no regularization term is added at test."""
+        if self.projection_matrix_ is None:
+            raise ValueError("LIM_NFST must be fitted before transform")
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X must have shape (n_samples, {self.n_features_in_})"
+            )
+        return center_normalize(X) @ self.projection_matrix_
+
     def predict(self, X):
-        Y_test = self.transform(X)
-        D = dist_to_basepoints(Y_test, self.base_points_)
-        scores = novelty_score(D)
-        idx = nearest_idx(D)
-        pred = self.classes_[idx]
-        pred[novelty_mask(D, self.threshold_)] = self.novel_label
-        return pred
+        distances = dist_to_basepoints(self.transform(X), self.base_points_)
+        indices = nearest_idx(distances)
+        prediction = np.asarray(self.classes_, dtype=object)[indices].copy()
+        prediction[novelty_mask(distances, self.threshold_)] = self.novel_label
+        return prediction
 
     def predict_closed(self, X):
-        Y_test = self.transform(X)
-        D = dist_to_basepoints(Y_test, self.base_points_)
-        idx = nearest_idx(D)
-        return self.classes_[idx]
-        
+        distances = dist_to_basepoints(self.transform(X), self.base_points_)
+        return self.classes_[nearest_idx(distances)]
