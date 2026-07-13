@@ -1,211 +1,203 @@
+"""Algorithm 1 of the revised LIM-NFST paper.
+
+All arrays in this implementation store samples by rows. The paper writes the
+normalized training matrix as ``X_tilde`` with samples by columns, so the paper
+matrix ``X_tilde.T`` corresponds to ``X_norm`` below.
+"""
+
+from __future__ import annotations
+
 import numpy as np
 
 
 def get_E(y):
+    """Return the n x c class-indicator matrix E."""
     y = np.asarray(y)
     classes = np.unique(y)
     E = np.zeros((len(y), len(classes)), dtype=np.float64)
-    
-    for i, cls in enumerate(classes):
-        E[y == cls, i] = 1.0
-        
+    for column, cls in enumerate(classes):
+        E[y == cls, column] = 1.0
     return E
 
+
 def get_W_H(y):
-    y = np.array(y)
+    """Return the paper's within-class averaging matrix W and centering H."""
+    y = np.asarray(y)
     n = len(y)
-    W = np.zeros((n, n), dtype=float)
-    
-    for c in np.unique(y):
-        idx = np.where(y == c)[0]
-        W[np.ix_(idx, idx)] = 1 / len(idx)
-        
-    H = np.ones((n, n), dtype=float) / n
-    
+    W = np.zeros((n, n), dtype=np.float64)
+    for cls in np.unique(y):
+        indices = np.flatnonzero(y == cls)
+        W[np.ix_(indices, indices)] = 1.0 / len(indices)
+    H = np.full((n, n), 1.0 / n, dtype=np.float64)
     return W, H
 
-def within_scatter(y, Psi_eps):
-    W, _ = get_W_H(y)
-    I = np.eye(Psi_eps.shape[0])
-    return Psi_eps @ (I - W) @ Psi_eps.T
-    
-def between_scatter(y, Psi_eps):
-    W, H = get_W_H(y)
-    return Psi_eps @ (W - H) @ Psi_eps.T
 
-# def get_Z(S):
-#     S = np.asarray(S, dtype=np.float64)
-#     R, pivot_cols = _rref(S)
-#     rank = len(pivot_cols)
+def psi_eps_times(X_norm, matrix, eps):
+    """Compute (Psi + eps I) @ matrix without constructing the n x n Psi."""
+    X_norm = np.asarray(X_norm, dtype=np.float64)
+    matrix = np.asarray(matrix, dtype=np.float64)
+    return X_norm @ (X_norm.T @ matrix) + eps * matrix
 
-#     Z_raw = _nullspace_basis_from_rref(R, pivot_cols)
-#     Z = _modified_gram_schmidt_columns(Z_raw)  # null space
-#     Z_perp = _modified_gram_schmidt_columns(R[:rank].T)  # anti null space
-#     return Z, Z_perp
-
-# def get_Q_w(X_norm, y, eps):
-#     if eps <= 0:
-#         raise ValueError("eps must be positive")
-
-#     E = get_E(y)
-#     n, d = X_norm.shape
-    
-#     # --- Bước 1: Giải hệ Woodbury (Giữ nguyên dùng solve là tốt nhất) ---
-#     G = X_norm.T @ X_norm
-#     R = X_norm.T @ E
-#     A = np.linalg.solve(G + eps * np.eye(d), R)
-    
-#     # --- Bước 2: Loại bỏ phép chia cho eps ---
-#     # Thay vì: Q = (E - X_norm @ A) / eps
-#     # Ta dùng:
-#     Q = E - X_norm @ A 
-#     # Lý do: Hệ số 1/eps là hằng số tỉ lệ, sẽ bị triệt tiêu bởi QR. 
-#     # Loại bỏ nó giúp tránh phóng đại sai số máy tính lên 1 triệu lần (nếu eps=1e-6).
-
-#     # --- Bước 3: Sửa lại Centering (Chuẩn hóa theo Cột) ---
-#     # Thay vì: Q = Q - Q.mean(axis=1, keepdims=True) (Trung bình hàng)
-#     # Ta dùng:
-#     Q = Q - Q.mean(axis=0) 
-#     # Lý do: Để trực giao với vector hằng số 1_n (điều kiện Z_t_perp), 
-#     # tổng mỗi cột của Q phải bằng 0. Do đó ta phải trừ trung bình cột (axis=0).
-
-#     # --- Bước 4: QR và trích xuất Rank ---
-#     Q_w, upper = np.linalg.qr(Q, mode='reduced')
-#     diag = np.abs(np.diag(upper))
-    
-#     if diag.size == 0:
-#         return np.empty((n, 0))
-    
-#     # Tính toán ngưỡng sai số để xác định rank thực tế
-#     tol = max(Q.shape) * diag.max() * np.finfo(np.float64).eps
-    
-#     # NFST bắt buộc lấy tối đa c-1 chiều phân biệt
-#     rank = min(int(np.sum(diag > tol)), len(np.unique(y)) - 1)
-    
-#     return Q_w[:, :rank], upper[:rank, :]
 
 def get_Q_w(X_norm, y, eps):
+    """Algorithm 1 steps 2-3: Woodbury solution, row-centering and QR.
+
+    The revised paper permits omitting the global ``1 / eps`` factor in Q:
+    QR removes that common scale and omission avoids magnifying round-off.
+    The returned subspace is therefore mathematically identical to Eq. 27.
+    """
+    X_norm = np.asarray(X_norm, dtype=np.float64)
+    y = np.asarray(y)
+    if X_norm.ndim != 2 or len(X_norm) != len(y):
+        raise ValueError("X_norm must be 2-D with one row per label")
     if eps <= 0:
         raise ValueError("eps must be positive")
 
     E = get_E(y)
-    E_centered = E - E.mean(axis=0, keepdims=True)
     n, d = X_norm.shape
+    c = E.shape[1]
+    if c < 2:
+        raise ValueError("LIM-NFST requires at least two known classes")
 
-    G = X_norm.T @ X_norm
-    R = X_norm.T @ E_centered
-    A = np.linalg.solve(G + eps * np.eye(d), R)
+    # Eq. 27 in row-major form:
+    # Q = eps^-1 [E - Xn (eps I_d + Xn.T Xn)^-1 Xn.T E].
+    rhs = X_norm.T @ E
+    correction = np.linalg.solve(
+        eps * np.eye(d, dtype=np.float64) + X_norm.T @ X_norm,
+        rhs,
+    )
+    Q_without_global_scale = E - X_norm @ correction
 
-    Q = (E_centered - X_norm @ A) / eps
+    # E 1_c = 1_n creates one trivial constant direction. Algorithm 1 removes
+    # it by centering every row across the c class-code columns.
+    Q_centered = Q_without_global_scale - Q_without_global_scale.mean(
+        axis=1, keepdims=True
+    )
+    required_rank = c - 1
+    numerical_rank = int(np.linalg.matrix_rank(Q_centered))
+    if numerical_rank < required_rank:
+        raise ValueError(
+            f"row-centered Q has rank {numerical_rank}; paper requires c-1={required_rank}"
+        )
 
-    Q_w, upper = np.linalg.qr(Q, mode="reduced")
-
-    diag = np.abs(np.diag(upper))
-    if diag.size == 0:
-        return np.empty((n, 0)), np.empty((0, E.shape[1]))
-
-    tol = max(Q.shape) * diag.max() * np.finfo(np.float64).eps
-    rank = min(int(np.sum(diag > tol)), len(np.unique(y)) - 1)
-
-    return Q_w[:, :rank], upper[:rank, :]
+    Q_full, R_full = np.linalg.qr(Q_centered, mode="reduced")
+    Q_w = Q_full[:, :required_rank]
+    R = R_full[:required_rank, :]
+    return Q_w, R
 
 
-def _psi_eps_times(X_norm, V, eps):
-    return X_norm @ (X_norm.T @ V) + eps * V
-
-
-def _projected_between_scatter(Z, y):
+def _reduced_between_scatter(E_w, y):      # note
+    """Compute E_w.T (W-H) E_w without materializing W or H."""
+    E_w = np.asarray(E_w, dtype=np.float64)
     y = np.asarray(y)
-    Z = np.asarray(Z, dtype=np.float64)
-    n, r = Z.shape
-    global_mean = Z.mean(axis=0)
-    scatter = np.zeros((r, r), dtype=np.float64)
-
+    global_mean = E_w.mean(axis=0)
+    scatter = np.zeros((E_w.shape[1], E_w.shape[1]), dtype=np.float64)
     for cls in np.unique(y):
-        Z_cls = Z[y == cls]
-        mean = Z_cls.mean(axis=0)
-        scatter += len(Z_cls) * np.outer(mean, mean)
+        rows = E_w[y == cls]
+        class_mean = rows.mean(axis=0)
+        scatter += len(rows) * np.outer(class_mean, class_mean)
+    scatter -= len(y) * np.outer(global_mean, global_mean)
+    return 0.5 * (scatter + scatter.T)
 
-    scatter -= n * np.outer(global_mean, global_mean)
-    return scatter
+
+def get_project(Q_w, R, y, n_components=None, *, return_eigenvalues=False):
+    """Algorithm 1 steps 4-6: reduced scatter EVD and Theta_init."""
+    Q_w = np.asarray(Q_w, dtype=np.float64)
+    R = np.asarray(R, dtype=np.float64)
+    y = np.asarray(y)
+    c = len(np.unique(y))
+    required = c - 1
+    requested = required if n_components is None else int(n_components)
+    if requested != required:
+        raise ValueError(
+            f"the revised paper fixes the projection dimension at c-1={required}"
+        )
+    if Q_w.shape[1] != required or R.shape != (required, c):
+        raise ValueError(
+            f"expected Q_w (n, {required}) and R ({required}, {c}); "
+            f"received {Q_w.shape} and {R.shape}"
+        )
+
+    # R is (c-1) x c after removal of the trivial direction, so the paper's
+    # R^-1 is its Moore-Penrose right inverse in an implementation.
+    E_w = get_E(y) @ np.linalg.pinv(R)   # note
+    reduced_scatter = _reduced_between_scatter(E_w, y)
+    eigenvalues, eigenvectors = np.linalg.eigh(reduced_scatter)
+    order = np.argsort(eigenvalues)[::-1]
+    selected_values = eigenvalues[order[:required]]
+    tolerance = (
+        max(reduced_scatter.shape)
+        * np.finfo(np.float64).eps
+        * max(float(np.max(np.abs(eigenvalues))), 1.0)
+    )
+    if np.any(selected_values <= tolerance):
+        raise ValueError(
+            "reduced between-class scatter does not have c-1 positive eigenvalues: "
+            f"{eigenvalues.tolist()}"
+        )
+
+    V = eigenvectors[:, order[:required]]
+    theta_init = Q_w @ V
+    if return_eigenvalues:
+        return theta_init, selected_values
+    return theta_init
 
 
-def get_project(Q_w, X_norm, y, eps, n_components=None):
-    if n_components is None:
-        n_components = Q_w.shape[1]
-    n_components = min(n_components, Q_w.shape[1])
-    
-    if n_components == 0:
-        return np.empty((Q_w.shape[0], 0))
+def regular_simplex_targets(n_classes, delta):
+    """Construct the (c-1) x c centered regular simplex T of edge delta."""
+    c = int(n_classes)
+    delta = float(delta)
+    if c < 2:
+        raise ValueError("a regular class simplex requires at least two vertices")
+    if not np.isfinite(delta) or delta <= 0:
+        raise ValueError("delta must be a finite positive edge length")
 
-    E_w = _psi_eps_times(X_norm, Q_w, eps)
-    S_b_prj = _projected_between_scatter(E_w, y)
-    S_b_prj = (S_b_prj + S_b_prj.T) / 2.0
-    
-    eigvals, eigvecs = np.linalg.eigh(S_b_prj)
-    
-    idx = np.argsort(eigvals)[::-1]
-    top_idx = idx[:n_components]
-    
-    V = eigvecs[:, top_idx]
-    L = eigvals[top_idx]
-    
-    # 4. WHITENING: Đây là chìa khóa để cách đều
-    # A = V * (1 / sqrt(L))
-    A = V @ np.diag(1.0 / np.sqrt(L + 1e-12)) # Thêm eps nhỏ để tránh chia cho 0
-    
-    theta_mtrx = Q_w @ A
-    # idx = np.argsort(eigvals)[::-1]
-    # A = eigvecs[:, idx[:n_components]]
-    
-    # theta_mtrx = Q_w @ A
-    
-    return theta_mtrx
+    centering = np.eye(c) - np.ones((c, c), dtype=np.float64) / c
+    values, vectors = np.linalg.eigh(centering)
+    basis = vectors[:, values > 0.5]
+    if basis.shape != (c, c - 1):
+        raise RuntimeError("failed to construct the centered simplex basis")
 
-def get_project(Q_w, R, y, dist=1.0):
+    # Columns of basis.T have pairwise distance sqrt(2); rescale to delta.
+    return (delta / np.sqrt(2.0)) * basis.T
+
+
+def align_to_simplex(theta_init, X_norm, y, eps, delta):
+    """Algorithm 1 steps 7-11: isometric centroid alignment.
+
+    Returns final Theta, target base points (one row per class), initial
+    centroid matrix M and alignment matrix A.
+    """
+    theta_init = np.asarray(theta_init, dtype=np.float64)
+    X_norm = np.asarray(X_norm, dtype=np.float64)
+    y = np.asarray(y)
     classes = np.unique(y)
-    c = len(classes)
-    
-    # 1. Tạo Target Points cách đều (Simplex)
-    # Tạo c điểm cách đều nhau trong không gian c-1 chiều
-    I = np.eye(c)
-    targets = I - np.mean(I, axis=0) # Centering
-    targets, _ = np.linalg.qr(targets.T) # Rút về c-1 chiều trực chuẩn
-    targets = targets.T * dist # Chỉnh khoảng cách theo ý muốn
-    
-    # 2. Tính tọa độ Centroids hiện tại trong Null Space
-    E = get_E(y)
-    # Tọa độ centroids trong Ew (không gian chưa trực chuẩn)
-    # M = (E.T @ E)^-1 @ E.T @ Ew @ A_qr (từ QR của Q)
-    # Đơn giản nhất: Lấy trung bình các mẫu đã chiếu lên Q_w theo từng lớp
-    E_w = E @ np.linalg.pinv(R)
-    current_centroids = []
-    for cls in classes:
-        m = E_w[y == cls].mean(axis=0)
-        current_centroids.append(m)
-    current_centroids = np.vstack(current_centroids).T # (c-1) x c
-    
-    # 3. Tính ma trận ánh xạ A
-    # A @ current_centroids = targets => A = targets @ pinv(current_centroids)
-    A = targets @ np.linalg.pinv(current_centroids)
-    
-    # Ma trận chiếu cuối cùng
-    return Q_w @ A.T
+    dimension = len(classes) - 1
+    if theta_init.shape != (len(y), dimension):
+        raise ValueError(
+            f"theta_init must have shape ({len(y)}, {dimension}); got {theta_init.shape}"
+        )
 
-def cal_base_point(theta_mtrx, X, y):
-    classes = np.unique(y)
-    base_points = []
+    Y_init = psi_eps_times(X_norm, theta_init, eps)
+    # Paper notation uses centroids as columns: M=[mu_1,...,mu_c].
+    M = np.vstack([Y_init[y == cls].mean(axis=0) for cls in classes]).T
+    if np.linalg.matrix_rank(M) < dimension:
+        raise ValueError("initial centroid matrix M is not full row rank")
 
-    for cls in classes:
-        class_mean = X[y == cls].mean(axis=0)
-        base_points.append((X @ class_mean) @ theta_mtrx)
-
-    return np.vstack(base_points)
-    
-    
+    T = regular_simplex_targets(len(classes), delta)
+    gram = M @ M.T
+    # A = T M.T (M M.T)^-1, evaluated with a linear solve.
+    A = np.linalg.solve(gram, M @ T.T).T
+    theta = theta_init @ A.T
+    return theta, T.T, M, A
 
 
-    
-
-
-    
+def cal_base_point(theta_mtrx, psi_eps, y):
+    """Compute class centroids of Psi_eps @ Theta (diagnostic helper)."""
+    theta_mtrx = np.asarray(theta_mtrx, dtype=np.float64)
+    psi_eps = np.asarray(psi_eps, dtype=np.float64)
+    y = np.asarray(y)
+    projected = psi_eps @ theta_mtrx
+    return np.vstack(
+        [projected[y == cls].mean(axis=0) for cls in np.unique(y)]
+    )
