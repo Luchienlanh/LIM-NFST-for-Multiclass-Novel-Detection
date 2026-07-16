@@ -1,5 +1,3 @@
-"""Paper-faithful revised LIM-NFST estimator."""
-
 from __future__ import annotations
 
 import numpy as np
@@ -20,20 +18,9 @@ from limnfst.novelty import (
 
 
 class LIM_NFST:
-    """Algorithms 1-2 from the revised LIM-NFST paper.
-
-    ``eps`` stabilizes only the training Woodbury system and ``delta`` is the
-    prescribed edge length of the regular simplex in Section 4.3.
-    """
+    """Algorithms 1-2 from the revised LIM-NFST paper."""
 
     def __init__(self, eps=1e-4, delta=2.0, novel_label=-1, subspace="qw"):
-        if subspace != "qw":
-            raise ValueError("the paper algorithm only defines subspace='qw'")
-        if eps <= 0:
-            raise ValueError("eps must be positive")
-        if not np.isfinite(delta) or delta <= 0:
-            raise ValueError("delta must be a finite positive edge length")
-
         self.eps = float(eps)
         self.delta = float(delta)
         self.novel_label = novel_label
@@ -43,15 +30,8 @@ class LIM_NFST:
     def fit(self, X, y, collect_diagnostics=False):
         X = np.ascontiguousarray(X, dtype=np.float64)
         y = np.asarray(y)
-        if X.ndim != 2 or len(X) != len(y):
-            raise ValueError("X must be 2-D with one row per label")
-        if not np.all(np.isfinite(X)):
-            raise ValueError("X contains NaN or infinite values")
-
         classes = np.unique(y)
-        if len(classes) < 2:
-            raise ValueError("LIM-NFST requires at least two known classes")
-
+        
         # Algorithm 1, step 1: Pearson sample normalization.
         X_norm = center_normalize(X)
 
@@ -76,13 +56,8 @@ class LIM_NFST:
             self.delta,
         )
 
-        # For unseen x, Algorithm 2 uses Psi_test Theta. This is exactly
-        # x_norm @ (X_train_norm.T @ Theta); no eps I term exists at test time.
         projection_matrix = X_norm.T @ theta
 
-        # Training centroids are defined in the regularized training system.
-        # They are computed only as a diagnostic; Algorithm 1 step 11 fixes the
-        # actual base points to the target simplex vertices t_j.
         Y_train = psi_eps_times(X_norm, theta, self.eps)
         empirical_centroids = np.vstack(
             [Y_train[y == cls].mean(axis=0) for cls in classes]
@@ -120,7 +95,7 @@ class LIM_NFST:
         self.diagnostics_ = self._build_diagnostics() if collect_diagnostics else None
         return self
 
-    def _build_diagnostics(self):
+    # def _build_diagnostics(self):
         c = len(self.classes_)
         edge_squared = dist_to_basepoints(self.base_points_, self.base_points_)
         off_diagonal = edge_squared[~np.eye(c, dtype=bool)]
@@ -195,20 +170,14 @@ class LIM_NFST:
         }
 
     def transform(self, X):
-        """Algorithm 2 steps 1-2; no regularization term is added at test."""
-        if self.projection_matrix_ is None:
-            raise ValueError("LIM_NFST must be fitted before transform")
+        """Algorithm 2 steps 1-2"""
         X = np.asarray(X, dtype=np.float64)
-        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
-            raise ValueError(
-                f"X must have shape (n_samples, {self.n_features_in_})"
-            )
         return center_normalize(X) @ self.projection_matrix_
 
     def predict(self, X):
         distances = dist_to_basepoints(self.transform(X), self.base_points_)
-        indices = nearest_idx(distances)
-        prediction = np.asarray(self.classes_, dtype=object)[indices].copy()
+        idx = nearest_idx(distances)
+        prediction = np.asarray(self.classes_, dtype=object)[idx].copy()
         prediction[novelty_mask(distances, self.threshold_)] = self.novel_label
         return prediction
 
