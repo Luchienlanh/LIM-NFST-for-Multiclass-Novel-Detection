@@ -72,6 +72,7 @@ def between_scatter(E_w, y):      # alternative method to compute Sb
     return 0.5 * (scatter + scatter.T)  # đảm bảo đối xứng
 
 
+
 def get_project(Q_w, R, y, n_components=None, *, return_eigenvalues=False):
     """Algorithm 1 steps 4-6: reduced scatter EVD and Theta_init."""
     Q_w = np.asarray(Q_w, dtype=np.float64)
@@ -79,8 +80,9 @@ def get_project(Q_w, R, y, n_components=None, *, return_eigenvalues=False):
     y = np.asarray(y)
     c = len(np.unique(y))
     required = c - 1
-
-    E_w = get_E(y) @ np.linalg.pinv(R)   
+    
+    R_pinv = np.linalg.pinv(R)
+    E_w = get_E(y) @ R_pinv   
     reduced_scatter = between_scatter(E_w, y)    # Sb = E_w.T (W-H) E_w
     eigenvalues, eigenvectors = np.linalg.eigh(reduced_scatter)
     order = np.argsort(eigenvalues)[::-1]
@@ -94,7 +96,7 @@ def get_project(Q_w, R, y, n_components=None, *, return_eigenvalues=False):
     V = eigenvectors[:, order[:required]]
     theta_init = Q_w @ V
     if return_eigenvalues:
-        return theta_init, selected_values
+        return theta_init, selected_values, V, R_pinv
     return theta_init
 
 
@@ -111,7 +113,7 @@ def regular_simplex_targets(n_classes, delta):
     return (delta / np.sqrt(2.0)) * basis.T
 
 
-def align_to_simplex(theta_init, X_norm, y, eps, delta):
+def align_to_simplex(theta_init, X_norm, y, eps, delta, initial_centroids=None):
     """Algorithm 1 steps 7-11: isometric centroid alignment.
 
     Returns final Theta, target base points (one row per class), initial
@@ -121,11 +123,14 @@ def align_to_simplex(theta_init, X_norm, y, eps, delta):
     X_norm = np.asarray(X_norm, dtype=np.float64)
     y = np.asarray(y)
     classes = np.unique(y)
-    dimension = len(classes) - 1
 
-    Y_init = psi_eps_times(X_norm, theta_init, eps)
-    # Paper notation uses centroids as columns: M=[mu_1,...,mu_c].
-    M = np.vstack([Y_init[y == cls].mean(axis=0) for cls in classes]).T
+    if initial_centroids is None:
+        Y_init = psi_eps_times(X_norm, theta_init, eps)
+        # Paper notation uses centroids as columns: M=[mu_1,...,mu_c].
+        M = np.vstack([Y_init[y == cls].mean(axis=0) for cls in classes]).T
+    else:
+        M = np.asarray(initial_centroids, dtype=np.float64)
+        
     
     T = regular_simplex_targets(len(classes), delta)
     gram = M @ M.T
