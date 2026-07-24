@@ -39,13 +39,14 @@ class LIM_NFST:
         Q_w, R = get_Q_w(X_norm, y, self.eps)
 
         # Steps 4-6: positive EVD directions produce Theta_init.
-        theta_init, eigenvalues = get_project(
+        theta_init, eigenvalues, V, R_pinv = get_project(
             Q_w,
             R,
             y,
             n_components=len(classes) - 1,
             return_eigenvalues=True,
         )
+        initial_centroids = (R_pinv @ V).T
 
         # Steps 7-11: map initial centroids to a regular simplex of edge delta.
         theta, target_base_points, initial_centroids, alignment = align_to_simplex(
@@ -54,20 +55,11 @@ class LIM_NFST:
             y,
             self.eps,
             self.delta,
+            initial_centroids=initial_centroids,
         )
 
         projection_matrix = X_norm.T @ theta
-
-        Y_train = psi_eps_times(X_norm, theta, self.eps)
-        empirical_centroids = np.vstack(
-            [Y_train[y == cls].mean(axis=0) for cls in classes]
-        )
         base_points = target_base_points
-
-        distances = dist_to_basepoints(Y_train, base_points)
-        train_nearest = nearest_idx(distances)
-        train_closed_pred = classes[train_nearest]
-        train_scores = np.min(distances, axis=1)
         threshold = get_threshold(self.delta)
 
         self.X_train_ = X
@@ -77,6 +69,8 @@ class LIM_NFST:
         self.classes_ = classes
         self.Q_w_ = Q_w
         self.R_w_ = R
+        self.R_w_pinv = R_pinv
+        self.between_eigenvectors_ = V
         self.theta_init_ = theta_init
         self.theta_ = theta
         self.between_eigenvalues_ = eigenvalues
@@ -84,11 +78,6 @@ class LIM_NFST:
         self.alignment_matrix_ = alignment
         self.projection_matrix_ = projection_matrix
         self.base_points_ = base_points
-        self.empirical_base_points_ = empirical_centroids
-        self.Y_train_ = Y_train
-        self.train_scores_ = train_scores
-        self.train_nearest_idx_ = train_nearest
-        self.train_closed_pred_ = train_closed_pred
         self.threshold_ = float(threshold)
         self.n_features_in_ = X.shape[1]
         self.subspace_shape_ = Q_w.shape
@@ -175,12 +164,14 @@ class LIM_NFST:
         return center_normalize(X) @ self.projection_matrix_
 
     def predict(self, X):
-        distances = dist_to_basepoints(self.transform(X), self.base_points_)
+        Y_test = self.transform(X)
+        distances = dist_to_basepoints(Y_test, self.base_points_)
         idx = nearest_idx(distances)
         prediction = np.asarray(self.classes_, dtype=object)[idx].copy()
         prediction[novelty_mask(distances, self.threshold_)] = self.novel_label
         return prediction
 
     def predict_closed(self, X):
-        distances = dist_to_basepoints(self.transform(X), self.base_points_)
+        Y_test = self.transform(X)
+        distances = dist_to_basepoints(Y_test, self.base_points_)
         return self.classes_[nearest_idx(distances)]
