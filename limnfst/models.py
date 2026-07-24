@@ -13,6 +13,7 @@ from limnfst.novelty import (
     dist_to_basepoints,
     get_threshold,
     nearest_idx,
+    novelty_score as minimum_novelty_score,
     novelty_mask,
 )
 
@@ -57,7 +58,7 @@ class LIM_NFST:
             self.delta,
             initial_centroids=initial_centroids,
         )
-
+        
         projection_matrix = X_norm.T @ theta
         base_points = target_base_points
         threshold = get_threshold(self.delta)
@@ -162,6 +163,16 @@ class LIM_NFST:
         """Algorithm 2 steps 1-2"""
         X = np.asarray(X, dtype=np.float64)
         return center_normalize(X) @ self.projection_matrix_
+
+    def novelty_score(self, X):
+        """Return the squared distance to the nearest learned base point.
+
+        Larger values indicate a more novel sample.  ``predict`` assigns the
+        novel label exactly when this score is greater than ``threshold_``.
+        """
+        Y_test = self.transform(X)
+        distances = dist_to_basepoints(Y_test, self.base_points_)
+        return minimum_novelty_score(distances)
 
     def predict(self, X):
         Y_test = self.transform(X)
