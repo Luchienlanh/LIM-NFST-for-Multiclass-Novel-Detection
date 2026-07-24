@@ -95,7 +95,7 @@ class LIM_NFST:
         self.diagnostics_ = self._build_diagnostics() if collect_diagnostics else None
         return self
 
-    # def _build_diagnostics(self):
+    def _build_diagnostics(self):
         c = len(self.classes_)
         edge_squared = dist_to_basepoints(self.base_points_, self.base_points_)
         off_diagonal = edge_squared[~np.eye(c, dtype=bool)]
