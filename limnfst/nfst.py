@@ -46,7 +46,7 @@ def get_Q_w(X_norm, y, eps):
         eps * np.eye(d, dtype=np.float64) + X_norm.T @ X_norm,
         X_norm.T @ E,
     )
-    Q = E - X_norm @ correction / eps
+    Q = (E - X_norm @ correction) / eps
 
     Q_centered = Q - Q.mean(axis=1, keepdims=True)
     
