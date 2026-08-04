@@ -1,168 +1,141 @@
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import (
+    LabelEncoder,
     MinMaxScaler,
     Normalizer,
-    OneHotEncoder,
-    OrdinalEncoder,
     QuantileTransformer,
     RobustScaler,
     StandardScaler,
 )
 
-from limnfst.sampling import stratified_min_per_class_sample
+
+SCALER_NAMES = (
+    "QuantileTransformer",
+    "StandardScaler",
+    "MinMaxScaler",
+    "RobustScaler",
+    "Normalizer",
+    "None",
+)
 
 
-def make_scaler(name: str, random_state: int = 42, n_samples: int | None = None):
-    key = name.lower()
-    if key in ("standard", "standardscaler"):
-        return StandardScaler()
-    if key in ("minmax", "minmaxscaler"):
-        return MinMaxScaler()
-    if key in ("robust", "robustscaler"):
-        return RobustScaler()
-    if key == "normalizer":
-        return Normalizer()
-    if key in ("quantile", "quantiletransformer"):
-        n_quantiles = 1000 if n_samples is None else min(1000, n_samples)
-        return QuantileTransformer(
-            n_quantiles=n_quantiles,
+def make_scaler(scaler_name, random_state):
+    scalers = {
+        "QuantileTransformer": QuantileTransformer(
             output_distribution="normal",
             random_state=random_state,
-        )
-    raise ValueError(f"Unknown scaler: {name}")
-
-
-def split(X, y, test_size=0.2, random_state=42, stratify=True):
-    stratify_arg = y if stratify else None
-    return train_test_split(
-        X,
-        y,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=stratify_arg,
-    )
-
-
-def _to_dataframe(X):
-    if isinstance(X, pd.DataFrame):
-        return X.copy()
-    return pd.DataFrame(X)
-
-
-def _encode_features(X_train, X_test, categorical="onehot"):
-    cat_cols = X_train.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
-    num_cols = [col for col in X_train.columns if col not in cat_cols]
-
-    parts_train = []
-    parts_test = []
-    artifacts = {
-        "num_cols": num_cols,
-        "cat_cols": cat_cols,
-        "num_imputer": None,
-        "cat_imputer": None,
-        "encoder": None,
+        ),
+        "StandardScaler": StandardScaler(),
+        "MinMaxScaler": MinMaxScaler(),
+        "RobustScaler": RobustScaler(),
+        "Normalizer": Normalizer(),
     }
 
-    if num_cols:
-        X_train_num = X_train[num_cols].replace([np.inf, -np.inf], np.nan)
-        X_test_num = X_test[num_cols].replace([np.inf, -np.inf], np.nan)
-
-        num_imputer = SimpleImputer(strategy="mean")
-        X_train_num = num_imputer.fit_transform(X_train_num)
-        X_test_num = num_imputer.transform(X_test_num)
-
-        parts_train.append(X_train_num)
-        parts_test.append(X_test_num)
-        artifacts["num_imputer"] = num_imputer
-
-    if cat_cols:
-        X_train_cat = X_train[cat_cols].astype("object")
-        X_test_cat = X_test[cat_cols].astype("object")
-        X_train_cat = X_train_cat.where(~X_train_cat.isna(), np.nan)
-        X_test_cat = X_test_cat.where(~X_test_cat.isna(), np.nan)
-
-        cat_imputer = SimpleImputer(strategy="most_frequent")
-        X_train_cat = cat_imputer.fit_transform(X_train_cat)
-        X_test_cat = cat_imputer.transform(X_test_cat)
-        X_train_cat = X_train_cat.astype(str)
-        X_test_cat = X_test_cat.astype(str)
-
-        if categorical == "onehot":
-            encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-        elif categorical == "ordinal":
-            encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-        else:
-            raise ValueError("categorical must be 'onehot' or 'ordinal'")
-
-        X_train_cat = encoder.fit_transform(X_train_cat)
-        X_test_cat = encoder.transform(X_test_cat)
-
-        parts_train.append(X_train_cat)
-        parts_test.append(X_test_cat)
-        artifacts["cat_imputer"] = cat_imputer
-        artifacts["encoder"] = encoder
-
-    if not parts_train:
-        raise ValueError("X has no usable columns")
-
-    X_train_out = np.hstack(parts_train).astype(np.float64)
-    X_test_out = np.hstack(parts_test).astype(np.float64)
-    return X_train_out, X_test_out, artifacts
+    if scaler_name not in scalers:
+        raise ValueError(
+            f"Unknown scaler {scaler_name!r}. Valid values: {SCALER_NAMES}."
+        )
+    return scalers[scaler_name]
 
 
-def preprocess(
-    X,
-    y,
-    *,
-    scaler="quantile",
-    test_size=0.2,
+def remove_training_outliers(X_train, y_train, contamination=0.05):
+    """Apply CPAI's class-wise LOF rule to training data only."""
+    kept_X = []
+    kept_y = []
+
+    for class_label in np.unique(y_train):
+        class_mask = y_train == class_label
+        class_X = X_train[class_mask]
+        class_y = y_train[class_mask]
+
+        # CPAI keeps encoded class zero unchanged.
+        if class_label == 0 or len(class_X) < 3:
+            kept_X.append(class_X)
+            kept_y.append(class_y)
+            continue
+
+        number_of_neighbors = min(20, len(class_X) - 1)
+        detector = LocalOutlierFactor(
+            n_neighbors=number_of_neighbors,
+            contamination=contamination,
+        )
+        is_inlier = detector.fit_predict(class_X) != -1
+        kept_X.append(class_X[is_inlier])
+        kept_y.append(class_y[is_inlier])
+
+    return np.vstack(kept_X), np.concatenate(kept_y)
+
+
+def preprocess_cpai_data(
+    dataframe,
+    scaler_name="QuantileTransformer",
     random_state=42,
-    stratify=True,
-    sample_train=False,
-    n_train_samples=None,
-    min_per_class=1,
-    categorical="onehot",
-    return_artifacts=False,
+    test_size=0.20,
 ):
-    X = _to_dataframe(X)
-    y = np.asarray(y)
+    """Run the CPAI poly=-1 preprocessing path for multiclass LIM.
 
-    X_train, X_test, y_train, y_test = split(
+    The only defensive addition is replacing every infinite value with NaN
+    and imputing non-finite columns for every dataset, not only IoTID20.
+    """
+    data = dataframe.to_numpy()
+    X = data[:, :-1].astype(np.float64)
+    raw_y = data[:, -1]
+
+    X[~np.isfinite(X)] = np.nan
+
+    X_train, X_test, raw_y_train, raw_y_test = train_test_split(
         X,
-        y,
+        raw_y,
         test_size=test_size,
+        stratify=raw_y,
         random_state=random_state,
-        stratify=stratify,
     )
 
-    if sample_train:
-        if n_train_samples is None:
-            raise ValueError("n_train_samples is required when sample_train=True")
-        X_train, y_train, sample_idx = stratified_min_per_class_sample(
-            X_train,
-            y_train,
-            n_samples=n_train_samples,
-            min_per_class=min_per_class,
-            random_state=random_state,
-            return_indices=True,
-        )
+    # Fit imputation on training data only, then apply the same values to test.
+    if np.isnan(X_train).any() or np.isnan(X_test).any():
+        imputer = SimpleImputer(strategy="mean")
+        X_train = imputer.fit_transform(X_train)
+        X_test = imputer.transform(X_test)
+
+    label_encoder = LabelEncoder()
+    y_train = label_encoder.fit_transform(raw_y_train)
+    y_test = label_encoder.transform(raw_y_test)
+
+    if scaler_name == "None":
+        X_train_scaled = X_train.copy()
+        X_test_scaled = X_test.copy()
     else:
-        sample_idx = None
+        scaler = make_scaler(scaler_name, random_state)
+        scaler.fit(X_train)
+        X_train_scaled = scaler.transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
 
-    X_train, X_test, artifacts = _encode_features(X_train, X_test, categorical=categorical)
+    X_train_scaled = np.nan_to_num(
+        X_train_scaled,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    X_test_scaled = np.nan_to_num(
+        X_test_scaled,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
 
-    sc = make_scaler(scaler, random_state=random_state, n_samples=len(X_train))
-    X_train = np.nan_to_num(sc.fit_transform(X_train), nan=0.0)
-    X_test = np.nan_to_num(sc.transform(X_test), nan=0.0)
-
-    if return_artifacts:
-        artifacts["scaler"] = sc
-        artifacts["sample_idx"] = sample_idx
-        return X_train, X_test, y_train, y_test, artifacts
-
-    return X_train, X_test, y_train, y_test
+    X_train_clean, y_train_clean = remove_training_outliers(
+        X_train_scaled,
+        y_train,
+    )
+    return (
+        X_train_clean,
+        y_train_clean,
+        X_test_scaled,
+        y_test,
+        label_encoder,
+    )
