@@ -1,188 +1,200 @@
 from __future__ import annotations
 
 import numpy as np
+from sklearn.model_selection import train_test_split
 
-from limnfst.mapping import center_normalize
-from limnfst.nfst import (
-    align_to_simplex,
-    get_Q_w,
-    get_project,
-    psi_eps_times,
-)
-from limnfst.novelty import (
-    dist_to_basepoints,
-    get_threshold,
-    nearest_idx,
-    novelty_score as minimum_novelty_score,
-    novelty_mask,
-)
+from .mapping import center_and_normalize, center_projection
+from .nfst import train_lim_projection
 
 
 class LIM_NFST:
-    """Algorithms 1-2 from the revised LIM-NFST paper."""
+    def __init__(
+        self,
+        epsilon=1e-4,
+        reference_size=0.20,
+        number_of_neighbors=5,
+        novelty_quantile=0.95,
+        random_state=42,
+    ):
+        self.epsilon = float(epsilon)
+        self.reference_size = float(reference_size)
+        self.number_of_neighbors = int(number_of_neighbors)
+        self.novelty_quantile = float(novelty_quantile)
+        self.random_state = int(random_state)
 
-    def __init__(self, eps=1e-4, delta=2.0, novel_label=-1, subspace="qw"):
-        self.eps = float(eps)
-        self.delta = float(delta)
-        self.novel_label = novel_label
-        self.subspace = subspace
+        # This remains None until fit() finishes learning the projection.
         self.projection_matrix_ = None
 
-    def fit(self, X, y, collect_diagnostics=False):
-        X = np.ascontiguousarray(X, dtype=np.float64)
+    # def _check_parameters(self):
+    #     if self.epsilon <= 0.0:
+    #         raise ValueError("epsilon must be greater than zero.")
+    #     if not 0.0 < self.reference_size < 1.0:
+    #         raise ValueError("reference_size must be between zero and one.")
+    #     if self.number_of_neighbors < 1:
+    #         raise ValueError("number_of_neighbors must be at least one.")
+    #     if not 0.0 < self.novelty_quantile < 1.0:
+    #         raise ValueError("novelty_quantile must be between zero and one.")
+
+    def fit(self, X, y):
+        """Learn the LIM projection and build one reference cloud per class."""
+        # self._check_parameters()
+
+        X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y)
-        classes = np.unique(y)
-        
-        # Algorithm 1, step 1: Pearson sample normalization.
-        X_norm = center_normalize(X)
 
-        # Steps 2-3: Woodbury Q, removal of the trivial direction, then QR.
-        Q_w, R = get_Q_w(X_norm, y, self.eps)
+        # if X.ndim != 2:
+        #     raise ValueError("X must be a two-dimensional matrix.")
+        # if len(X) != len(y):
+        #     raise ValueError("X and y must contain the same number of samples.")
+        # if not np.isfinite(X).all():
+        #     raise ValueError("X contains NaN or infinite values.")
 
-        # Steps 4-6: positive EVD directions produce Theta_init.
-        theta_init, eigenvalues, V, R_pinv = get_project(
-            Q_w,
-            R,
+        # X_fit is used to learn Theta. X_reference is never used to learn it.
+        X_fit, X_reference, y_fit, y_reference = train_test_split(
+            X,
             y,
-            n_components=len(classes) - 1,
-            return_eigenvalues=True,
+            test_size=self.reference_size,
+            stratify=y,
+            random_state=self.random_state,
         )
-        initial_centroids = (R_pinv @ V).T
 
-        # Steps 7-11: map initial centroids to a regular simplex of edge delta.
-        theta, target_base_points, initial_centroids, alignment = align_to_simplex(
-            theta_init,
-            X_norm,
-            y,
-            self.eps,
-            self.delta,
-            initial_centroids=initial_centroids,
+        X_fit_normalized = center_and_normalize(X_fit)
+        classes, theta, projection_matrix, base_points = train_lim_projection(
+            X_fit_normalized,
+            y_fit,
+            self.epsilon,
         )
-        
-        projection_matrix = X_norm.T @ theta
-        base_points = target_base_points
-        threshold = get_threshold(self.delta)
 
-        self.X_train_ = X
-        self.X_train_norm_ = X_norm
-        self.y_train_ = y
-        self.y_fit_ = y
         self.classes_ = classes
-        self.Q_w_ = Q_w
-        self.R_w_ = R
-        self.R_w_pinv = R_pinv
-        self.between_eigenvectors_ = V
-        self.theta_init_ = theta_init
         self.theta_ = theta
-        self.between_eigenvalues_ = eigenvalues
-        self.initial_centroids_ = initial_centroids
-        self.alignment_matrix_ = alignment
         self.projection_matrix_ = projection_matrix
         self.base_points_ = base_points
-        self.threshold_ = float(threshold)
+        self.X_fit_ = X_fit
+        self.y_fit_ = y_fit
+        self.X_reference_ = X_reference
+        self.y_reference_ = y_reference
         self.n_features_in_ = X.shape[1]
-        self.subspace_shape_ = Q_w.shape
-        self.diagnostics_ = self._build_diagnostics() if collect_diagnostics else None
+
+        # Project the held-out reference samples through the learned LIM map.
+        self.reference_projection_ = self.transform(X_reference)
+
+        self.reference_points_ = []
+        self.reference_thresholds_ = []
+
+        for class_label in self.classes_:
+            class_reference_points = self.reference_projection_[
+                y_reference == class_label
+            ]
+
+            # At least two points are required for leave-one-out calibration.
+            # if len(class_reference_points) < 2:
+            #     raise ValueError(
+            #         f"Class {class_label!r} needs at least two reference samples."
+            #     )
+
+            threshold = self._calculate_reference_threshold(
+                class_reference_points
+            )
+
+            self.reference_points_.append(class_reference_points)
+            self.reference_thresholds_.append(threshold)
+
+        self.reference_thresholds_ = np.asarray(
+            self.reference_thresholds_,
+            dtype=np.float64,
+        )
         return self
 
-    def _build_diagnostics(self):
-        c = len(self.classes_)
-        edge_squared = dist_to_basepoints(self.base_points_, self.base_points_)
-        off_diagonal = edge_squared[~np.eye(c, dtype=bool)]
-        centroid_error = np.linalg.norm(
-            self.empirical_base_points_ - self.base_points_, axis=1
-        )
-
-        projected_within = np.zeros(
-            (c - 1, c - 1), dtype=np.float64
-        )
-        for class_index, cls in enumerate(self.classes_):
-            residual = self.Y_train_[self.y_fit_ == cls] - self.base_points_[class_index]
-            projected_within += residual.T @ residual
-
-        train_accuracy = float(
-            np.mean(self.train_closed_pred_ == self.y_fit_) * 100
-        )
-        _, counts = np.unique(self.y_fit_, return_counts=True)
-        return {
-            "algorithm": "lim-nfst-revised-paper-algorithm-1-2",
-            "subspace": self.subspace,
-            "n_train": int(len(self.y_fit_)),
-            "n_features": int(self.n_features_in_),
-            "n_classes": int(c),
-            "class_counts": {
-                str(cls): int(count)
-                for cls, count in zip(self.classes_, counts)
-            },
-            "eps": self.eps,
-            "delta": self.delta,
-            "basis_label": "Q_w",
-            "basis_shape": list(map(int, self.Q_w_.shape)),
-            "qr_r_shape": list(map(int, self.R_w_.shape)),
-            "theta_init_shape": list(map(int, self.theta_init_.shape)),
-            "theta_shape": list(map(int, self.theta_.shape)),
-            "projection_shape": list(map(int, self.projection_matrix_.shape)),
-            "base_points_shape": list(map(int, self.base_points_.shape)),
-            "between_eigenvalues": self.between_eigenvalues_.astype(float).tolist(),
-            "threshold_rule": "Algorithm 2: squared distance > 0.25 * delta^2",
-            "threshold": self.threshold_,
-            "threshold_min": self.threshold_,
-            "threshold_mean": self.threshold_,
-            "threshold_max": self.threshold_,
-            "min_basepoint_distance": float(np.sqrt(np.min(off_diagonal))),
-            "min_basepoint_squared_distance": float(np.min(off_diagonal)),
-            "max_basepoint_edge_error": float(
-                np.max(np.abs(np.sqrt(off_diagonal) - self.delta))
-            ),
-            "max_centroid_alignment_error": float(np.max(centroid_error)),
-            "train_score_min": float(np.min(self.train_scores_)),
-            "train_score_mean": float(np.mean(self.train_scores_)),
-            "train_score_max": float(np.max(self.train_scores_)),
-            "train_closed_set_accuracy": train_accuracy,
-            "projected_within_scatter_fro": float(
-                np.linalg.norm(projected_within, ord="fro")
-            ),
-            "max_train_to_own_base_distance": float(
-                np.sqrt(np.max(self.train_scores_))
-            ),
-            "paper_invariants": {
-                "dimension_is_c_minus_1": bool(self.theta_.shape[1] == c - 1),
-                "simplex_is_centered": bool(
-                    np.allclose(self.base_points_.mean(axis=0), 0.0, atol=1e-9)
-                ),
-                "all_simplex_edges_equal_delta": bool(
-                    np.allclose(off_diagonal, self.delta**2, rtol=1e-8, atol=1e-10)
-                ),
-                "threshold_is_quarter_delta_squared": bool(
-                    np.isclose(self.threshold_, 0.25 * self.delta**2)
-                ),
-            },
-        }
-
     def transform(self, X):
-        """Algorithm 2 steps 1-2"""
+        """Normalize and project samples into the c-dimensional LIM space."""
+        if self.projection_matrix_ is None:
+            raise RuntimeError("Call fit before transform.")
+
         X = np.asarray(X, dtype=np.float64)
-        return center_normalize(X) @ self.projection_matrix_
+        if X.ndim != 2:
+            raise ValueError("X must be a two-dimensional matrix.")
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"Expected {self.n_features_in_} features, got {X.shape[1]}."
+            )
 
-    def novelty_score(self, X):
-        """Return the squared distance to the nearest learned base point.
+        X_normalized = center_and_normalize(X)
+        projected_X = X_normalized @ self.projection_matrix_
+        return center_projection(projected_X)
 
-        Larger values indicate a more novel sample.  ``predict`` assigns the
-        novel label exactly when this score is greater than ``threshold_``.
-        """
-        Y_test = self.transform(X)
-        distances = dist_to_basepoints(Y_test, self.base_points_)
-        return minimum_novelty_score(distances)
+    def _mean_nearest_distance(
+        self,
+        projected_X,
+        reference_points,
+        exclude_same_sample=False,
+    ):
+        """Mean squared distance to the k nearest points in one class."""
+        differences = (
+            projected_X[:, np.newaxis, :]
+            - reference_points[np.newaxis, :, :]
+        )
+        squared_distances = np.sum(differences * differences, axis=2)
 
-    def predict(self, X):
-        Y_test = self.transform(X)
-        distances = dist_to_basepoints(Y_test, self.base_points_)
-        idx = nearest_idx(distances)
-        prediction = np.asarray(self.classes_, dtype=object)[idx].copy()
-        prediction[novelty_mask(distances, self.threshold_)] = self.novel_label
-        return prediction
+        if exclude_same_sample:
+            # During calibration each reference point must not match itself.
+            np.fill_diagonal(squared_distances, np.inf)
+            available_neighbors = len(reference_points) - 1
+        else:
+            available_neighbors = len(reference_points)
+
+        number_of_neighbors = min(
+            self.number_of_neighbors,
+            available_neighbors,
+        )
+        sorted_distances = np.sort(squared_distances, axis=1)
+        nearest_distances = sorted_distances[:, :number_of_neighbors]
+        return nearest_distances.mean(axis=1)
+
+    def _calculate_reference_threshold(self, class_reference_points):
+        """Calibrate a class novelty threshold by leave-one-out distances."""
+        leave_one_out_scores = self._mean_nearest_distance(
+            class_reference_points,
+            class_reference_points,
+            exclude_same_sample=True,
+        )
+        threshold = np.quantile(
+            leave_one_out_scores,
+            self.novelty_quantile,
+        )
+        return max(float(threshold), 1e-12)
+
+    def reference_scores(self, X):
+        """Return one reference distance per sample and class."""
+        projected_X = self.transform(X)
+        scores_by_class = []
+
+        for class_reference_points in self.reference_points_:
+            class_scores = self._mean_nearest_distance(
+                projected_X,
+                class_reference_points,
+            )
+            scores_by_class.append(class_scores)
+
+        return np.column_stack(scores_by_class)
 
     def predict_closed(self, X):
-        Y_test = self.transform(X)
-        distances = dist_to_basepoints(Y_test, self.base_points_)
-        return self.classes_[nearest_idx(distances)]
+        """Choose the class with the smallest reference-cloud distance."""
+        scores = self.reference_scores(X)
+        class_indices = np.argmin(scores, axis=1)
+        return self.classes_[class_indices]
+
+    def novelty_scores(self, X):
+        """Return predicted-class distance divided by its fitted threshold."""
+        scores = self.reference_scores(X)
+        predicted_indices = np.argmin(scores, axis=1)
+        row_indices = np.arange(len(scores))
+
+        predicted_scores = scores[row_indices, predicted_indices]
+        predicted_thresholds = self.reference_thresholds_[predicted_indices]
+        return predicted_scores / predicted_thresholds
+
+    def predict_open(self, X, novel_label=-1):
+        """Replace predictions whose novelty score exceeds one."""
+        predictions = np.asarray(self.predict_closed(X), dtype=object)
+        predictions[self.novelty_scores(X) > 1.0] = novel_label
+        return predictions
