@@ -1,4 +1,4 @@
-"""Run LIM experiments and tune ReferenceLIM with a simple grid search."""
+"""Run LIM experiments and tune LIM-NFST with optional RFF features."""
 
 from __future__ import annotations
 
@@ -42,13 +42,13 @@ from cpai.preprocessing import (
     preprocess as cpai_preprocess,
 )
 from limnfst.models import LIM_NFST
-from reference_lim import ReferenceLIM, ReferenceResidualLIM, ResidualLIM
+from reference_lim import ReferenceResidualLIM, ResidualLIM
 
 
 CPAI_POLY = -1
 CPAI_KERNEL = None
 CPAI_TEST_SIZE = 0.20
-LIM_VERSION_NAME = "lim_reference_v1"
+LIM_VERSION_NAME = "lim_nfst_rff_v1"
 
 DEFAULT_LIMITS = {
     "BoT_IoT": 1000,
@@ -64,6 +64,8 @@ DEFAULT_SEEDS = [42, 43, 44, 45, 46]
 DEFAULT_GRID_SCALERS = list(SCALERS)
 DEFAULT_GRID_REFERENCE_SIZES = [0.10, 0.15, 0.20, 0.25, 0.30]
 DEFAULT_GRID_NEIGHBORS = [1, 3, 5, 7, 9]
+DEFAULT_GRID_RFF_COMPONENTS = [128, 256, 512]
+DEFAULT_GRID_RFF_GAMMA_MULTIPLIERS = [0.10, 1.0, 10.0]
 
 METRIC_COLUMNS = [
     "accuracy",
@@ -77,11 +79,11 @@ RESULT_COLUMNS = ["dataset", "model", *METRIC_COLUMNS]
 
 
 def get_lim_version():
-    """Create a short version from the current ReferenceLIM source files."""
+    """Create a short version from the current LIM-NFST source files."""
     source_files = [
-        REFERENCE_ROOT / "reference_lim" / "reference_model.py",
-        REFERENCE_ROOT / "reference_lim" / "nfst.py",
-        REFERENCE_ROOT / "reference_lim" / "mapping.py",
+        CLASSIFIER_ROOT / "limnfst" / "models.py",
+        CLASSIFIER_ROOT / "limnfst" / "nfst.py",
+        CLASSIFIER_ROOT / "limnfst" / "mapping.py",
     ]
 
     code_hash = hashlib.sha256()
@@ -147,7 +149,7 @@ def save_json(path, data):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate LIM models or tune ReferenceLIM."
+        description="Evaluate or tune LIM-NFST with optional RFF."
     )
     parser.add_argument("--grid-search", action="store_true")
     parser.add_argument("--dataset", choices=DATASETS, default=None)
@@ -168,6 +170,10 @@ def parse_args():
 
     parser.add_argument("--reference-size", type=float, default=0.20)
     parser.add_argument("--neighbors", type=int, default=5)
+    parser.add_argument("--epsilon", type=float, default=1e-4)
+    parser.add_argument("--use-rff", action="store_true")
+    parser.add_argument("--rff-components", type=int, default=256)
+    parser.add_argument("--rff-gamma-multiplier", type=float, default=1.0)
 
     parser.add_argument(
         "--grid-scalers",
@@ -186,6 +192,18 @@ def parse_args():
         nargs="+",
         type=int,
         default=DEFAULT_GRID_NEIGHBORS,
+    )
+    parser.add_argument(
+        "--grid-rff-components",
+        nargs="+",
+        type=int,
+        default=DEFAULT_GRID_RFF_COMPONENTS,
+    )
+    parser.add_argument(
+        "--grid-rff-gamma-multipliers",
+        nargs="+",
+        type=float,
+        default=DEFAULT_GRID_RFF_GAMMA_MULTIPLIERS,
     )
     parser.add_argument("--validation-size", type=float, default=0.20)
     parser.add_argument(
@@ -314,6 +332,12 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
         raise ValueError("--reference-size must be in (0, 0.30].")
     if args.neighbors < 1:
         raise ValueError("--neighbors must be at least one.")
+    if args.epsilon <= 0.0:
+        raise ValueError("--epsilon must be greater than zero.")
+    if args.use_rff and args.rff_components < 1:
+        raise ValueError("--rff-components must be at least one.")
+    if args.use_rff and args.rff_gamma_multiplier <= 0.0:
+        raise ValueError("--rff-gamma-multiplier must be greater than zero.")
 
     version = get_lim_version()
     dataset_name = "all" if run_all else datasets[0]
@@ -324,6 +348,12 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
             f"__reference_size={number_to_name(args.reference_size)}"
             f"__neighbors={args.neighbors}"
         )
+        if args.use_rff:
+            folder_name += (
+                f"__rff_components={args.rff_components}"
+                "__rff_gamma_multiplier="
+                f"{number_to_name(args.rff_gamma_multiplier)}"
+            )
         output_dir = (
             WORKSPACE_ROOT
             / "results"
@@ -344,6 +374,15 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
         "scaler": args.scaler,
         "reference_size": args.reference_size,
         "neighbors": args.neighbors,
+        "epsilon": args.epsilon,
+        "use_rff": args.use_rff,
+        "rff_components": args.rff_components if args.use_rff else None,
+        "rff_gamma_mode": (
+            "scale_times_multiplier" if args.use_rff else None
+        ),
+        "rff_gamma_multiplier": (
+            args.rff_gamma_multiplier if args.use_rff else None
+        ),
     }
     save_json(output_dir / "parameters.json", manifest)
 
@@ -354,10 +393,15 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
     print(f"Scaler     : {args.scaler}")
     print(f"Reference  : {args.reference_size}")
     print(f"Neighbors  : {args.neighbors}")
+    print(f"Use RFF    : {args.use_rff}")
+    if args.use_rff:
+        print(f"RFF dims   : {args.rff_components}")
+        print(f"Gamma mult : {args.rff_gamma_multiplier}")
     print(f"Output     : {output_dir.resolve()}")
 
     run_results = []
     errors = []
+    gamma_by_run = {}
 
     for dataset in datasets:
         limit = DEFAULT_LIMITS[dataset] if run_all else (
@@ -376,8 +420,8 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
                     )
                 )
 
-                original_model = LIM_NFST()
-                reference_model = ReferenceLIM(
+                lim_model = LIM_NFST(
+                    epsilon=args.epsilon,
                     reference_size=args.reference_size,
                     number_of_neighbors=args.neighbors,
                     random_state=seed,
@@ -390,15 +434,31 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
                 )
 
                 models = [
-                    ("LIM_NFST", original_model),
-                    ("LIM_Reference", reference_model),
+                    ("LIM_NFST", lim_model),
                     ("LIM_Residual", residual_model),
                     ("LIM_Reference_Residual", combined_model),
                 ]
 
+                if args.use_rff:
+                    rff_model = LIM_NFST(
+                        epsilon=args.epsilon,
+                        reference_size=args.reference_size,
+                        number_of_neighbors=args.neighbors,
+                        random_state=seed,
+                        use_rff=True,
+                        rff_components=args.rff_components,
+                        rff_gamma_multiplier=args.rff_gamma_multiplier,
+                    )
+                    models.insert(1, ("RFF_LIM_NFST", rff_model))
+
                 for model_name, model in models:
                     model.fit(X_train, y_train)
                     y_pred = model.predict_closed(X_test)
+
+                    if model_name == "RFF_LIM_NFST":
+                        gamma_by_run[f"{dataset}__seed={seed}"] = (
+                            model.rff_gamma_
+                        )
 
                     row = {
                         "dataset": dataset,
@@ -432,6 +492,8 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
 
     if errors:
         save_json(output_dir / "errors.json", errors)
+    if gamma_by_run:
+        save_json(output_dir / "rff_gamma_by_run.json", gamma_by_run)
 
     print("\nFinal results:")
     print(results.to_string(index=False))
@@ -441,6 +503,8 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
 def run_grid_search(args, datasets, seeds, run_all):
     if not 0.0 < args.validation_size < 1.0:
         raise ValueError("--validation-size must be between zero and one.")
+    if args.epsilon <= 0.0:
+        raise ValueError("--epsilon must be greater than zero.")
     if any(
         value <= 0.0 or value > 0.30
         for value in args.grid_reference_sizes
@@ -448,34 +512,79 @@ def run_grid_search(args, datasets, seeds, run_all):
         raise ValueError("Grid reference sizes must be in (0, 0.30].")
     if any(value < 1 for value in args.grid_neighbors):
         raise ValueError("Grid neighbors must be at least one.")
+    if args.use_rff and any(
+        value < 1 for value in args.grid_rff_components
+    ):
+        raise ValueError("Grid RFF components must be at least one.")
+    if args.use_rff and any(
+        value <= 0.0 for value in args.grid_rff_gamma_multipliers
+    ):
+        raise ValueError(
+            "Grid RFF gamma multipliers must be greater than zero."
+        )
 
     version = get_lim_version()
+    grid_mode = "rff" if args.use_rff else "no-rff"
     output_dir = args.output_dir or (
-        WORKSPACE_ROOT / "results" / "lim-models" / version
+        WORKSPACE_ROOT / "results" / "lim-models" / version / grid_mode
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.use_rff:
+        rff_settings = [
+            (components, multiplier)
+            for components in args.grid_rff_components
+            for multiplier in args.grid_rff_gamma_multipliers
+        ]
+    else:
+        rff_settings = [(None, None)]
+
+    number_of_configurations = (
+        len(args.grid_scalers)
+        * len(args.grid_reference_sizes)
+        * len(args.grid_neighbors)
+        * len(rff_settings)
+    )
+    model_name = "RFF_LIM_NFST" if args.use_rff else "LIM_NFST"
+
     manifest = {
-        "mode": "ReferenceLIM grid search",
+        "mode": f"{model_name} grid search",
         "lim_code_version": version,
         "datasets": datasets,
         "seeds": seeds,
         "scalers": args.grid_scalers,
         "reference_sizes": args.grid_reference_sizes,
         "neighbors": args.grid_neighbors,
+        "epsilon": args.epsilon,
+        "use_rff": args.use_rff,
+        "rff_components": (
+            args.grid_rff_components if args.use_rff else None
+        ),
+        "rff_gamma_mode": (
+            "scale_times_multiplier" if args.use_rff else None
+        ),
+        "rff_gamma_multipliers": (
+            args.grid_rff_gamma_multipliers if args.use_rff else None
+        ),
         "selection_metric": args.selection_metric,
         "validation_size": args.validation_size,
+        "configurations_per_dataset": number_of_configurations,
         "outer_test_used_for_selection": False,
     }
     save_json(output_dir / "grid_parameters.json", manifest)
 
-    print("Mode       : ReferenceLIM grid search")
+    print(f"Mode       : {model_name} grid search")
     print(f"Version    : {version}")
     print(f"Datasets   : {datasets}")
     print(f"Seeds      : {seeds}")
     print(f"Scalers    : {args.grid_scalers}")
     print(f"Ref sizes  : {args.grid_reference_sizes}")
     print(f"Neighbors  : {args.grid_neighbors}")
+    print(f"Use RFF    : {args.use_rff}")
+    if args.use_rff:
+        print(f"RFF dims   : {args.grid_rff_components}")
+        print(f"Gamma mult : {args.grid_rff_gamma_multipliers}")
+    print(f"Configs/data: {number_of_configurations}")
     print(f"Metric     : {args.selection_metric}")
     print(f"Output     : {output_dir.resolve()}")
 
@@ -513,131 +622,208 @@ def run_grid_search(args, datasets, seeds, run_all):
                     )
 
         for scaler in args.grid_scalers:
-            for reference_size in args.grid_reference_sizes:
-                for neighbors in args.grid_neighbors:
-                    configuration_name = (
-                        f"scaler={scaler}"
-                        f"__reference_size={number_to_name(reference_size)}"
-                        f"__neighbors={neighbors}"
-                    )
-                    configuration_dir = (
-                        output_dir / dataset / configuration_name
-                    )
-                    configuration_dir.mkdir(parents=True, exist_ok=True)
-
-                    parameters = {
-                        "dataset": dataset,
-                        "model": "LIM_Reference",
-                        "scaler": scaler,
-                        "reference_size": reference_size,
-                        "neighbors": neighbors,
-                        "seeds": seeds,
-                        "selection_metric": args.selection_metric,
-                        "lim_code_version": version,
-                        "outer_test_used_for_selection": False,
-                    }
-                    save_json(configuration_dir / "parameters.json", parameters)
-
-                    configuration_runs = []
-                    configuration_errors = []
-
-                    for seed in seeds:
-                        prepared_data = validation_data[(scaler, seed)]
-                        if prepared_data is None:
-                            configuration_errors.append(
-                                {
-                                    "seed": seed,
-                                    "error": "Preprocessing failed.",
-                                }
+            for rff_components, gamma_multiplier in rff_settings:
+                for reference_size in args.grid_reference_sizes:
+                    for neighbors in args.grid_neighbors:
+                        configuration_name = (
+                            f"scaler={scaler}"
+                            f"__reference_size="
+                            f"{number_to_name(reference_size)}"
+                            f"__neighbors={neighbors}"
+                        )
+                        if args.use_rff:
+                            configuration_name += (
+                                f"__rff_components={rff_components}"
+                                "__rff_gamma_multiplier="
+                                f"{number_to_name(gamma_multiplier)}"
                             )
-                            continue
-
-                        X_train, y_train, X_validation, y_validation = (
-                            prepared_data
+                        configuration_dir = (
+                            output_dir / dataset / configuration_name
+                        )
+                        configuration_dir.mkdir(
+                            parents=True,
+                            exist_ok=True,
                         )
 
-                        try:
-                            model = ReferenceLIM(
-                                reference_size=reference_size,
-                                number_of_neighbors=neighbors,
-                                random_state=seed,
-                            )
-                            model.fit(X_train, y_train)
-                            y_pred = model.predict_closed(X_validation)
-
-                            row = {
-                                "dataset": dataset,
-                                "model": "LIM_Reference",
-                                "seed": seed,
-                            }
-                            row.update(
-                                calculate_metrics(y_validation, y_pred)
-                            )
-                            configuration_runs.append(row)
-                        except Exception as error:
-                            configuration_errors.append(
-                                {
-                                    "seed": seed,
-                                    "error": (
-                                        f"{type(error).__name__}: {error}"
-                                    ),
-                                }
-                            )
-
-                    configuration_result = average_results(
-                        configuration_runs,
-                        include_overall=False,
-                    )
-                    configuration_result.to_csv(
-                        configuration_dir / "results.csv",
-                        index=False,
-                        float_format="%.8f",
-                    )
-
-                    if configuration_errors:
-                        save_json(
-                            configuration_dir / "errors.json",
-                            configuration_errors,
-                        )
-
-                    complete = len(configuration_runs) == len(seeds)
-                    if complete and not configuration_result.empty:
-                        metric_values = configuration_result.iloc[0].to_dict()
-
-                        report_row = {
+                        parameters = {
                             "dataset": dataset,
-                            "model": (
-                                "LIM_Reference"
-                                f"[scaler={scaler},"
-                                f"reference_size={reference_size:g},"
-                                f"neighbors={neighbors}]"
-                            ),
-                        }
-                        for metric in METRIC_COLUMNS:
-                            report_row[metric] = metric_values[metric]
-                        all_grid_results.append(report_row)
-
-                        candidate = {
-                            "dataset": dataset,
+                            "model": model_name,
                             "scaler": scaler,
                             "reference_size": reference_size,
                             "neighbors": neighbors,
+                            "epsilon": args.epsilon,
+                            "use_rff": args.use_rff,
+                            "rff_components": rff_components,
+                            "rff_gamma_mode": (
+                                "scale_times_multiplier"
+                                if args.use_rff
+                                else None
+                            ),
+                            "rff_gamma_multiplier": gamma_multiplier,
+                            "seeds": seeds,
+                            "selection_metric": args.selection_metric,
+                            "lim_code_version": version,
+                            "outer_test_used_for_selection": False,
                         }
-                        for metric in METRIC_COLUMNS:
-                            candidate[metric] = metric_values[metric]
-                        candidates.append(candidate)
+                        save_json(
+                            configuration_dir / "parameters.json",
+                            parameters,
+                        )
 
-                        print(
-                            f"dataset={dataset} scaler={scaler} "
-                            f"ref={reference_size:g} k={neighbors} "
-                            f"{args.selection_metric}="
-                            f"{candidate[args.selection_metric]:.4f}"
+                        configuration_runs = []
+                        configuration_errors = []
+                        gamma_by_seed = {}
+
+                        for seed in seeds:
+                            prepared_data = validation_data[(scaler, seed)]
+                            if prepared_data is None:
+                                configuration_errors.append(
+                                    {
+                                        "seed": seed,
+                                        "error": "Preprocessing failed.",
+                                    }
+                                )
+                                continue
+
+                            (
+                                X_train,
+                                y_train,
+                                X_validation,
+                                y_validation,
+                            ) = prepared_data
+
+                            try:
+                                model = LIM_NFST(
+                                    epsilon=args.epsilon,
+                                    reference_size=reference_size,
+                                    number_of_neighbors=neighbors,
+                                    random_state=seed,
+                                    use_rff=args.use_rff,
+                                    rff_components=(
+                                        rff_components
+                                        if args.use_rff
+                                        else 256
+                                    ),
+                                    rff_gamma_multiplier=(
+                                        gamma_multiplier
+                                        if args.use_rff
+                                        else 1.0
+                                    ),
+                                )
+                                model.fit(X_train, y_train)
+                                y_pred = model.predict_closed(X_validation)
+
+                                if args.use_rff:
+                                    gamma_by_seed[str(seed)] = (
+                                        model.rff_gamma_
+                                    )
+
+                                row = {
+                                    "dataset": dataset,
+                                    "model": model_name,
+                                    "seed": seed,
+                                }
+                                row.update(
+                                    calculate_metrics(
+                                        y_validation,
+                                        y_pred,
+                                    )
+                                )
+                                configuration_runs.append(row)
+                            except Exception as error:
+                                message = (
+                                    f"{type(error).__name__}: {error}"
+                                )
+                                configuration_errors.append(
+                                    {"seed": seed, "error": message}
+                                )
+                                all_errors.append(
+                                    {
+                                        "dataset": dataset,
+                                        "scaler": scaler,
+                                        "reference_size": reference_size,
+                                        "neighbors": neighbors,
+                                        "rff_components": rff_components,
+                                        "rff_gamma_multiplier": (
+                                            gamma_multiplier
+                                        ),
+                                        "seed": seed,
+                                        "error": message,
+                                    }
+                                )
+
+                        if gamma_by_seed:
+                            save_json(
+                                configuration_dir
+                                / "rff_gamma_by_seed.json",
+                                gamma_by_seed,
+                            )
+
+                        configuration_result = average_results(
+                            configuration_runs,
+                            include_overall=False,
                         )
-                    else:
-                        print(
-                            f"FAILED dataset={dataset} scaler={scaler} "
-                            f"ref={reference_size:g} k={neighbors}"
+                        configuration_result.to_csv(
+                            configuration_dir / "results.csv",
+                            index=False,
+                            float_format="%.8f",
                         )
+
+                        if configuration_errors:
+                            save_json(
+                                configuration_dir / "errors.json",
+                                configuration_errors,
+                            )
+
+                        complete = len(configuration_runs) == len(seeds)
+                        if complete and not configuration_result.empty:
+                            metric_values = (
+                                configuration_result.iloc[0].to_dict()
+                            )
+
+                            report_row = {
+                                "dataset": dataset,
+                                "model": (
+                                    f"{model_name}[{configuration_name}]"
+                                ),
+                            }
+                            for metric in METRIC_COLUMNS:
+                                report_row[metric] = metric_values[metric]
+                            all_grid_results.append(report_row)
+
+                            candidate = {
+                                "dataset": dataset,
+                                "scaler": scaler,
+                                "reference_size": reference_size,
+                                "neighbors": neighbors,
+                                "epsilon": args.epsilon,
+                                "use_rff": args.use_rff,
+                                "rff_components": rff_components,
+                                "rff_gamma_multiplier": gamma_multiplier,
+                            }
+                            for metric in METRIC_COLUMNS:
+                                candidate[metric] = metric_values[metric]
+                            candidates.append(candidate)
+
+                            message = (
+                                f"dataset={dataset} scaler={scaler} "
+                                f"ref={reference_size:g} k={neighbors}"
+                            )
+                            if args.use_rff:
+                                message += (
+                                    f" rff={rff_components} "
+                                    f"gamma_mult={gamma_multiplier:g}"
+                                )
+                            message += (
+                                f" {args.selection_metric}="
+                                f"{candidate[args.selection_metric]:.4f}"
+                            )
+                            print(message)
+                        else:
+                            print(
+                                f"FAILED dataset={dataset} "
+                                f"configuration={configuration_name}"
+                            )
 
     grid_results = pd.DataFrame(all_grid_results, columns=RESULT_COLUMNS)
     grid_results.to_csv(
@@ -665,9 +851,13 @@ def run_grid_search(args, datasets, seeds, run_all):
                     "mcc",
                     "reference_size",
                     "neighbors",
+                    "rff_components" if args.use_rff else None,
                 ]
             )
         )
+        ranking_columns = [
+            column for column in ranking_columns if column is not None
+        ]
         descending_metrics = {
             "accuracy",
             "balanced_accuracy",
@@ -690,6 +880,21 @@ def run_grid_search(args, datasets, seeds, run_all):
                 "scaler": best["scaler"],
                 "reference_size": best["reference_size"],
                 "neighbors": int(best["neighbors"]),
+                "epsilon": float(best["epsilon"]),
+                "use_rff": args.use_rff,
+                "rff_components": (
+                    int(best["rff_components"])
+                    if args.use_rff
+                    else None
+                ),
+                "rff_gamma_mode": (
+                    "scale_times_multiplier" if args.use_rff else None
+                ),
+                "rff_gamma_multiplier": (
+                    float(best["rff_gamma_multiplier"])
+                    if args.use_rff
+                    else None
+                ),
                 "selection_metric": args.selection_metric,
                 "validation_score": best[args.selection_metric],
                 "lim_code_version": version,

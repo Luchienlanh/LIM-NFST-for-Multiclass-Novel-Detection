@@ -37,11 +37,9 @@ from sklearn.svm import NuSVC
 CLASSIFIER_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = CLASSIFIER_ROOT.parent
 CPAI_ROOT = WORKSPACE_ROOT / "CPAI-main" / "CPAI-main" / "code"
-REFERENCE_ROOT = WORKSPACE_ROOT / "limnfst-reference-classifier"
 
 sys.path.insert(0, str(CLASSIFIER_ROOT))
 sys.path.insert(0, str(CPAI_ROOT))
-sys.path.insert(0, str(REFERENCE_ROOT))
 
 from cpai.datasets import DATASETS, load_dataset
 from cpai.models import KNFST
@@ -50,15 +48,14 @@ from cpai.preprocessing import (
     _remove_outliers_lof,
     preprocess as cpai_preprocess,
 )
-from limnfst.mapping import center_normalize
+from limnfst.mapping import center_and_normalize as center_normalize
 from limnfst.models import LIM_NFST
-from reference_lim import ReferenceLIM
 
 
 CPAI_POLY = -1
 CPAI_KERNEL = None
 CPAI_TEST_SIZE = 0.20
-LIM_VERSION_NAME = "lim_reference_v1"
+LIM_VERSION_NAME = "lim_nfst_rff_v1"
 
 DEFAULT_LIMITS = {
     "BoT_IoT": 1000,
@@ -74,7 +71,7 @@ DEFAULT_SEEDS = [42, 43, 44, 45, 46]
 
 MODEL_NAMES = [
     "LIM_NFST",
-    "LIM_Reference",
+    "RFF_LIM_NFST",
     "kNFST",
     "LDA",
     "GaussianNB",
@@ -98,9 +95,9 @@ RESULT_COLUMNS = ["dataset", "model", *METRIC_COLUMNS]
 
 def get_lim_version():
     source_files = [
-        REFERENCE_ROOT / "reference_lim" / "reference_model.py",
-        REFERENCE_ROOT / "reference_lim" / "nfst.py",
-        REFERENCE_ROOT / "reference_lim" / "mapping.py",
+        CLASSIFIER_ROOT / "limnfst" / "models.py",
+        CLASSIFIER_ROOT / "limnfst" / "nfst.py",
+        CLASSIFIER_ROOT / "limnfst" / "mapping.py",
     ]
 
     code_hash = hashlib.sha256()
@@ -113,6 +110,24 @@ def get_lim_version():
 
 def number_to_name(value):
     return format(float(value), ".6g").replace(".", "p")
+
+
+def find_default_best_parameters_file(parameter_source, current_version):
+    grid_mode = "no-rff" if parameter_source == "lim_ref" else "rff"
+    root = WORKSPACE_ROOT / "results" / "lim-models"
+    exact_file = root / current_version / grid_mode / "best_parameters.csv"
+    if exact_file.exists():
+        return exact_file
+
+    available_files = list(root.glob(f"*/{grid_mode}/best_parameters.csv"))
+    if parameter_source == "lim_ref":
+        available_files.extend(root.glob("*/best_parameters.csv"))
+    else:
+        legacy_root = WORKSPACE_ROOT / "results" / "rff-ref-lim"
+        available_files.extend(legacy_root.glob("*/best_parameters.csv"))
+    if available_files:
+        return max(available_files, key=lambda path: path.stat().st_mtime)
+    return exact_file
 
 
 def calculate_metrics(y_true, y_pred):
@@ -173,7 +188,18 @@ def parse_args():
         choices=["best", "fixed"],
         default="best",
     )
+    parser.add_argument(
+        "--best-parameter-source",
+        choices=["lim_ref", "rff_ref"],
+        default="lim_ref",
+        help=(
+            "lim_ref: use the no-RFF grid from lim-models.py; "
+            "rff_ref: use the RFF grid from lim-models.py."
+        ),
+    )
     parser.add_argument("--best-parameters-file", type=Path, default=None)
+    parser.add_argument("--rff-components", type=int, default=256)
+    parser.add_argument("--rff-gamma-multiplier", type=float, default=1.0)
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
 
@@ -238,7 +264,12 @@ def normalize_data(X_train, X_test, normalization_mode):
     return X_train, X_test
 
 
-def load_best_parameters(file_path, datasets, current_version):
+def load_best_parameters(
+    file_path,
+    datasets,
+    current_version,
+    parameter_source,
+):
     if not file_path.exists():
         raise FileNotFoundError(
             f"Cannot find {file_path}. Run lim-models.py --grid-search first."
@@ -252,6 +283,14 @@ def load_best_parameters(file_path, datasets, current_version):
         "neighbors",
         "lim_code_version",
     }
+    if parameter_source == "rff_ref":
+        required_columns.update(
+            {
+                "rff_components",
+                "rff_gamma_mode",
+                "rff_gamma_multiplier",
+            }
+        )
     missing_columns = required_columns - set(parameters.columns)
     if missing_columns:
         raise ValueError(
@@ -267,10 +306,11 @@ def load_best_parameters(file_path, datasets, current_version):
             raise ValueError(f"No best parameters found for {dataset}.")
 
         row = selected.iloc[0]
-        if str(row["lim_code_version"]) != current_version:
-            raise ValueError(
-                f"Parameters for {dataset} belong to another LIM version. "
-                "Run the grid search again."
+        stored_version = str(row["lim_code_version"])
+        if stored_version != current_version:
+            print(
+                f"WARNING: {dataset} parameters use {stored_version}, "
+                f"current LIM version is {current_version}."
             )
 
         scaler = str(row["scaler"])
@@ -286,24 +326,78 @@ def load_best_parameters(file_path, datasets, current_version):
         if neighbors < 1:
             raise ValueError(f"Invalid neighbors for {dataset}: {neighbors}")
 
-        result[dataset] = {
+        dataset_parameters = {
             "scaler": scaler,
             "reference_size": reference_size,
             "neighbors": neighbors,
+            "epsilon": float(row.get("epsilon", 1e-4)),
+            "use_rff": parameter_source == "rff_ref",
+            "rff_components": None,
+            "rff_gamma_multiplier": None,
         }
+
+        if parameter_source == "rff_ref":
+            if "use_rff" in parameters.columns:
+                stored_use_rff = str(row["use_rff"]).lower()
+                if stored_use_rff not in {"true", "1"}:
+                    raise ValueError(
+                        f"RFF parameters for {dataset} have use_rff="
+                        f"{row['use_rff']}"
+                    )
+            rff_gamma_mode = str(row["rff_gamma_mode"])
+            if rff_gamma_mode != "scale_times_multiplier":
+                raise ValueError(
+                    f"Unsupported RFF gamma mode for {dataset}: "
+                    f"{rff_gamma_mode}"
+                )
+
+            rff_components = int(row["rff_components"])
+            gamma_multiplier = float(row["rff_gamma_multiplier"])
+            if rff_components < 1:
+                raise ValueError(
+                    f"Invalid RFF components for {dataset}: "
+                    f"{rff_components}"
+                )
+            if gamma_multiplier <= 0.0:
+                raise ValueError(
+                    f"Invalid RFF gamma multiplier for {dataset}: "
+                    f"{gamma_multiplier}"
+                )
+
+            dataset_parameters["rff_components"] = rff_components
+            dataset_parameters["rff_gamma_multiplier"] = gamma_multiplier
+
+        result[dataset] = dataset_parameters
 
     return result
 
 
-def create_model(model_name, seed, reference_size, neighbors):
+def create_model(
+    model_name,
+    seed,
+    reference_size,
+    neighbors,
+    epsilon,
+    rff_components,
+    rff_gamma_multiplier,
+):
     """Create one model. Kept explicit so each configuration is visible."""
     if model_name == "LIM_NFST":
-        return LIM_NFST()
-    if model_name == "LIM_Reference":
-        return ReferenceLIM(
+        return LIM_NFST(
+            epsilon=epsilon,
             reference_size=reference_size,
             number_of_neighbors=neighbors,
             random_state=seed,
+        )
+    if model_name == "RFF_LIM_NFST":
+        return LIM_NFST(
+            epsilon=epsilon,
+            reference_size=reference_size,
+            number_of_neighbors=neighbors,
+            random_state=seed,
+            use_rff=True,
+            rff_components=rff_components,
+            rff_gamma_multiplier=rff_gamma_multiplier,
         )
     if model_name == "kNFST":
         return KNFST(kernel="rbf")
@@ -381,7 +475,6 @@ def main():
         raise ValueError("--limit can only be used with one --dataset.")
 
     datasets = list(DATASETS) if run_all else [args.dataset]
-    model_names = args.models or MODEL_NAMES
 
     if args.seeds is not None:
         seeds = args.seeds
@@ -392,12 +485,9 @@ def main():
 
     version = get_lim_version()
     if args.best_parameters_file is None:
-        args.best_parameters_file = (
-            WORKSPACE_ROOT
-            / "results"
-            / "lim-models"
-            / version
-            / "best_parameters.csv"
+        args.best_parameters_file = find_default_best_parameters_file(
+            args.best_parameter_source,
+            version,
         )
 
     if args.lim_parameter_mode == "best":
@@ -405,27 +495,91 @@ def main():
             args.best_parameters_file,
             datasets,
             version,
+            args.best_parameter_source,
         )
-        parameter_name = "best-grid-parameters"
+        parameter_name = (
+            f"best-grid-parameters__source={args.best_parameter_source}"
+        )
     else:
         if not 0.0 < args.reference_size <= 0.30:
             raise ValueError("--reference-size must be in (0, 0.30].")
         if args.reference_neighbors < 1:
             raise ValueError("--reference-neighbors must be at least one.")
+        if args.best_parameter_source == "rff_ref":
+            if args.rff_components < 1:
+                raise ValueError("--rff-components must be at least one.")
+            if args.rff_gamma_multiplier <= 0.0:
+                raise ValueError(
+                    "--rff-gamma-multiplier must be greater than zero."
+                )
 
         parameters_by_dataset = {
             dataset: {
                 "scaler": args.scaler,
                 "reference_size": args.reference_size,
                 "neighbors": args.reference_neighbors,
+                "epsilon": 1e-4,
+                "use_rff": args.best_parameter_source == "rff_ref",
+                "rff_components": (
+                    args.rff_components
+                    if args.best_parameter_source == "rff_ref"
+                    else None
+                ),
+                "rff_gamma_multiplier": (
+                    args.rff_gamma_multiplier
+                    if args.best_parameter_source == "rff_ref"
+                    else None
+                ),
             }
             for dataset in datasets
         }
         parameter_name = (
-            f"fixed__scaler={args.scaler}"
+            f"fixed__source={args.best_parameter_source}"
+            f"__scaler={args.scaler}"
             f"__reference_size={number_to_name(args.reference_size)}"
             f"__neighbors={args.reference_neighbors}"
         )
+        if args.best_parameter_source == "rff_ref":
+            parameter_name += (
+                f"__rff_components={args.rff_components}"
+                "__rff_gamma_multiplier="
+                f"{number_to_name(args.rff_gamma_multiplier)}"
+            )
+
+    if args.models is None:
+        model_names = [
+            "LIM_NFST",
+        ]
+        if args.best_parameter_source == "rff_ref":
+            model_names.append("RFF_LIM_NFST")
+        model_names.extend(
+            [
+                "kNFST",
+                "LDA",
+                "GaussianNB",
+                "KNeighbors",
+                "NearestCentroid",
+                "RadiusNeighbors",
+                "NuSVC",
+                "SGD",
+            ]
+        )
+    else:
+        model_names = args.models
+
+    if "RFF_LIM_NFST" in model_names:
+        missing_rff_parameters = [
+            dataset
+            for dataset, parameters in parameters_by_dataset.items()
+            if parameters["rff_components"] is None
+            or parameters["rff_gamma_multiplier"] is None
+        ]
+        if missing_rff_parameters:
+            raise ValueError(
+                "RFF_LIM_NFST needs RFF parameters. Select "
+                "--best-parameter-source rff_ref. Missing datasets: "
+                f"{missing_rff_parameters}"
+            )
 
     if args.output_dir is None:
         output_dir = (
@@ -448,6 +602,12 @@ def main():
             "seeds": seeds,
             "normalization_mode": args.normalization_mode,
             "lim_parameter_mode": args.lim_parameter_mode,
+            "best_parameter_source": args.best_parameter_source,
+            "best_parameters_file": (
+                str(args.best_parameters_file.resolve())
+                if args.lim_parameter_mode == "best"
+                else None
+            ),
             "parameters_by_dataset": parameters_by_dataset,
         },
     )
@@ -456,10 +616,12 @@ def main():
     print(f"Datasets   : {datasets}")
     print(f"Models     : {model_names}")
     print(f"Seeds      : {seeds}")
+    print(f"Best source: {args.best_parameter_source}")
     print(f"Output     : {output_dir.resolve()}")
 
     run_results = []
     errors = []
+    gamma_by_run = {}
 
     for dataset in datasets:
         parameters = parameters_by_dataset[dataset]
@@ -513,10 +675,22 @@ def main():
                         seed,
                         parameters["reference_size"],
                         parameters["neighbors"],
+                        parameters["epsilon"],
+                        parameters["rff_components"],
+                        parameters["rff_gamma_multiplier"],
                     )
+
                     model.fit(X_train, y_train)
 
-                    if model_name in ["LIM_NFST", "LIM_Reference"]:
+                    if model_name == "RFF_LIM_NFST":
+                        gamma_by_run[f"{dataset}__seed={seed}"] = (
+                            model.rff_gamma_
+                        )
+
+                    if model_name in [
+                        "LIM_NFST",
+                        "RFF_LIM_NFST",
+                    ]:
                         y_pred = model.predict_closed(X_test)
                     else:
                         y_pred = model.predict(X_test)
@@ -557,6 +731,8 @@ def main():
 
     if errors:
         save_json(output_dir / "errors.json", errors)
+    if gamma_by_run:
+        save_json(output_dir / "rff_gamma_by_run.json", gamma_by_run)
 
     print("\nFinal results:")
     print(results.to_string(index=False))
