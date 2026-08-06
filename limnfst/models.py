@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+from sklearn.kernel_approximation import RBFSampler
 from sklearn.model_selection import train_test_split
 
 from .mapping import center_and_normalize, center_projection
@@ -15,15 +16,63 @@ class LIM_NFST:
         number_of_neighbors=5,
         novelty_quantile=0.95,
         random_state=42,
+        use_rff=False,
+        rff_components=256,
+        rff_gamma_multiplier=1.0,
     ):
         self.epsilon = float(epsilon)
         self.reference_size = float(reference_size)
         self.number_of_neighbors = int(number_of_neighbors)
         self.novelty_quantile = float(novelty_quantile)
         self.random_state = int(random_state)
+        self.use_rff = bool(use_rff)
+        self.rff_components = int(rff_components)
+        self.rff_gamma_multiplier = float(rff_gamma_multiplier)
 
         # This remains None until fit() finishes learning the projection.
         self.projection_matrix_ = None
+        self.rff_mapper_ = None
+        self.rff_gamma_ = None
+
+    def _calculate_rff_gamma(self, X):
+        """Calculate gamma='scale', then apply the configured multiplier."""
+        variance = float(np.var(X))
+        if not np.isfinite(variance) or variance <= 0.0:
+            raise ValueError(
+                "Cannot calculate RFF gamma because training variance is "
+                f"{variance}."
+            )
+
+        scale_gamma = 1.0 / (X.shape[1] * variance)
+        return scale_gamma * self.rff_gamma_multiplier
+
+    def _fit_rff(self, X):
+        """Fit the optional RFF map and return the model input features."""
+        if not self.use_rff:
+            self.rff_mapper_ = None
+            self.rff_gamma_ = None
+            return X
+
+        if self.rff_components < 1:
+            raise ValueError("rff_components must be at least one.")
+        if self.rff_gamma_multiplier <= 0.0:
+            raise ValueError("rff_gamma_multiplier must be greater than zero.")
+
+        self.rff_gamma_ = self._calculate_rff_gamma(X)
+        self.rff_mapper_ = RBFSampler(
+            gamma=self.rff_gamma_,
+            n_components=self.rff_components,
+            random_state=self.random_state,
+        )
+        return self.rff_mapper_.fit_transform(X)
+
+    def _apply_rff(self, X):
+        """Apply the fitted RFF map, or keep the original features."""
+        if not self.use_rff:
+            return X
+        if self.rff_mapper_ is None:
+            raise RuntimeError("Call fit before applying RFF.")
+        return self.rff_mapper_.transform(X)
 
     # def _check_parameters(self):
     #     if self.epsilon <= 0.0:
@@ -41,6 +90,10 @@ class LIM_NFST:
 
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y)
+
+        self.n_features_in_ = X.shape[1]
+        X = self._fit_rff(X)
+        self.model_features_in_ = X.shape[1]
 
         # if X.ndim != 2:
         #     raise ValueError("X must be a two-dimensional matrix.")
@@ -73,10 +126,11 @@ class LIM_NFST:
         self.y_fit_ = y_fit
         self.X_reference_ = X_reference
         self.y_reference_ = y_reference
-        self.n_features_in_ = X.shape[1]
 
-        # Project the held-out reference samples through the learned LIM map.
-        self.reference_projection_ = self.transform(X_reference)
+        # X_reference is already in the optional RFF space at this point.
+        self.reference_projection_ = self._project_model_features(
+            X_reference
+        )
 
         self.reference_points_ = []
         self.reference_thresholds_ = []
@@ -105,8 +159,14 @@ class LIM_NFST:
         )
         return self
 
+    def _project_model_features(self, X):
+        """Project features that are already in the model input space."""
+        X_normalized = center_and_normalize(X)
+        projected_X = X_normalized @ self.projection_matrix_
+        return center_projection(projected_X)
+
     def transform(self, X):
-        """Normalize and project samples into the c-dimensional LIM space."""
+        """Apply optional RFF and project into the c-dimensional LIM space."""
         if self.projection_matrix_ is None:
             raise RuntimeError("Call fit before transform.")
 
@@ -118,9 +178,8 @@ class LIM_NFST:
                 f"Expected {self.n_features_in_} features, got {X.shape[1]}."
             )
 
-        X_normalized = center_and_normalize(X)
-        projected_X = X_normalized @ self.projection_matrix_
-        return center_projection(projected_X)
+        X = self._apply_rff(X)
+        return self._project_model_features(X)
 
     def _mean_nearest_distance(
         self,
