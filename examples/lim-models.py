@@ -1,4 +1,4 @@
-"""Run LIM experiments and tune LIM-NFST with optional RFF features."""
+"""Run LIM experiments and tune LIM-NFST with Stratified K-fold CV."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -15,13 +16,7 @@ import pandas as pd
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    matthews_corrcoef,
-    precision_recall_fscore_support,
-)
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 
@@ -41,6 +36,15 @@ from cpai.preprocessing import (
     _scaler as make_scaler,
     preprocess as cpai_preprocess,
 )
+from limnfst.metrics import (
+    CORE_METRIC_COLUMNS,
+    CURVE_METRIC_COLUMNS,
+    PROBABILITY_METRIC_COLUMNS,
+    calculate_summary_metrics,
+    distances_to_scores,
+    save_cross_validation_ranking_plots,
+    scores_to_probabilities,
+)
 from limnfst.models import LIM_NFST
 from reference_lim import ReferenceResidualLIM, ResidualLIM
 
@@ -48,7 +52,7 @@ from reference_lim import ReferenceResidualLIM, ResidualLIM
 CPAI_POLY = -1
 CPAI_KERNEL = None
 CPAI_TEST_SIZE = 0.20
-LIM_VERSION_NAME = "lim_nfst_rff_v1"
+LIM_VERSION_NAME = "lim_nfst_rff_cv_v2"
 
 DEFAULT_LIMITS = {
     "BoT_IoT": 1000,
@@ -67,13 +71,17 @@ DEFAULT_GRID_NEIGHBORS = [1, 3, 5, 7, 9]
 DEFAULT_GRID_RFF_COMPONENTS = [128, 256, 512]
 DEFAULT_GRID_RFF_GAMMA_MULTIPLIERS = [0.10, 1.0, 10.0]
 
+GRID_TIMING_COLUMNS = [
+    "fit_seconds",
+    "predict_test_seconds",
+    "predict_per_sample_seconds",
+    "predict_throughput_samples_per_second",
+]
 METRIC_COLUMNS = [
-    "accuracy",
-    "balanced_accuracy",
-    "macro_precision",
-    "macro_recall",
-    "macro_f1",
-    "mcc",
+    *CORE_METRIC_COLUMNS,
+    *CURVE_METRIC_COLUMNS,
+    *PROBABILITY_METRIC_COLUMNS,
+    *GRID_TIMING_COLUMNS,
 ]
 RESULT_COLUMNS = ["dataset", "model", *METRIC_COLUMNS]
 
@@ -84,6 +92,8 @@ def get_lim_version():
         CLASSIFIER_ROOT / "limnfst" / "models.py",
         CLASSIFIER_ROOT / "limnfst" / "nfst.py",
         CLASSIFIER_ROOT / "limnfst" / "mapping.py",
+        CLASSIFIER_ROOT / "limnfst" / "metrics.py",
+        CLASSIFIER_ROOT / "examples" / "lim-models.py",
     ]
 
     code_hash = hashlib.sha256()
@@ -98,21 +108,29 @@ def number_to_name(value):
     return format(float(value), ".6g").replace(".", "p")
 
 
-def calculate_metrics(y_true, y_pred):
-    precision, recall, f1, _ = precision_recall_fscore_support(
+def calculate_metrics(
+    y_true,
+    y_pred,
+    y_score=None,
+    fit_seconds=None,
+    predict_seconds=None,
+):
+    y_proba = (
+        scores_to_probabilities(y_score)
+        if y_score is not None
+        else None
+    )
+    metrics = calculate_summary_metrics(
         y_true,
         y_pred,
-        average="macro",
-        zero_division=0,
+        y_score=y_score,
+        y_proba=y_proba,
+        fit_seconds=fit_seconds,
+        predict_seconds=predict_seconds,
     )
-
     return {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-        "macro_precision": precision,
-        "macro_recall": recall,
-        "macro_f1": f1,
-        "mcc": matthews_corrcoef(y_true, y_pred),
+        metric: metrics[metric]
+        for metric in METRIC_COLUMNS
     }
 
 
@@ -138,6 +156,27 @@ def average_results(run_results, include_overall=True):
         results = pd.concat([results, overall], ignore_index=True)
 
     return results[RESULT_COLUMNS]
+
+
+def summarize_cross_validation(run_results):
+    """Return mean and standard deviation across completed CV folds."""
+    if not run_results:
+        columns = ["dataset", "model", "completed_folds"]
+        for metric in METRIC_COLUMNS:
+            columns.extend([f"{metric}_mean", f"{metric}_std"])
+        return pd.DataFrame(columns=columns)
+
+    runs = pd.DataFrame(run_results)
+    row = {
+        "dataset": runs.iloc[0]["dataset"],
+        "model": runs.iloc[0]["model"],
+        "completed_folds": len(runs),
+    }
+    for metric in METRIC_COLUMNS:
+        values = runs[metric]
+        row[f"{metric}_mean"] = values.mean()
+        row[f"{metric}_std"] = values.std(ddof=1)
+    return pd.DataFrame([row])
 
 
 def save_json(path, data):
@@ -205,10 +244,29 @@ def parse_args():
         type=float,
         default=DEFAULT_GRID_RFF_GAMMA_MULTIPLIERS,
     )
-    parser.add_argument("--validation-size", type=float, default=0.20)
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=5,
+        help=(
+            "Number of StratifiedKFold splits used to score every grid "
+            "configuration. Every configuration runs on every fold."
+        ),
+    )
     parser.add_argument(
         "--selection-metric",
-        choices=["macro_f1", "balanced_accuracy", "accuracy", "mcc"],
+        choices=[
+            "macro_f1",
+            "weighted_f1",
+            "micro_f1",
+            "balanced_accuracy",
+            "accuracy",
+            "mcc",
+            "cohen_kappa",
+            "roc_auc_ovr_macro",
+            "average_precision_macro",
+            "pr_auc_macro",
+        ],
         default="macro_f1",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -225,6 +283,10 @@ def get_datasets_and_seeds(args):
 
     if args.seeds is not None:
         seeds = args.seeds
+    elif args.grid_search:
+        # K-fold already repeats every configuration. Use one CV seed by
+        # default; --seeds explicitly enables repeated K-fold evaluation.
+        seeds = [args.seed]
     elif run_all:
         seeds = DEFAULT_SEEDS
     else:
@@ -276,8 +338,90 @@ def preprocess_fixed_experiment(dataframe, dataset, scaler, seed):
     return X_train, y_train, X_test, y_test, encoder
 
 
-def prepare_grid_data(dataframe, dataset, scaler, seed, validation_size):
-    """Create an inner validation split without touching the outer test set."""
+def predict_closed_with_scores(model_name, model, X):
+    """Return hard predictions and class scores where larger is better."""
+    if model_name in {"LIM_NFST", "RFF_LIM_NFST"}:
+        distances = model.reference_scores(X)
+        y_score = distances_to_scores(distances)
+        predicted_indices = np.argmax(y_score, axis=1)
+        return model.classes_[predicted_indices], y_score
+
+    if model_name == "LIM_Residual":
+        distances = model.residual_scores(X)
+        y_score = distances_to_scores(distances)
+        predicted_indices = np.argmax(y_score, axis=1)
+        return model.classes_[predicted_indices], y_score
+
+    # ReferenceResidualLIM can change an ambiguous reference decision with
+    # residual tie-breaking, so use predict_closed for labels. Reference
+    # distances remain the continuous ranking scores used by ROC/PR metrics.
+    y_pred = model.predict_closed(X)
+    y_score = distances_to_scores(model.reference_scores(X))
+    return y_pred, y_score
+
+
+def preprocess_grid_fold(
+    X_train,
+    y_train,
+    X_validation,
+    y_validation,
+    dataset,
+    scaler,
+    seed,
+):
+    """Fit preprocessing on one fold's training rows only."""
+    X_train = X_train.copy()
+    X_validation = X_validation.copy()
+    y_train = y_train.copy()
+    y_validation = y_validation.copy()
+
+    order = y_train.argsort()
+    X_train = X_train[order]
+    y_train = y_train[order]
+
+    if dataset == "IoTID20":
+        X_train[np.isinf(X_train)] = np.nan
+        X_validation[np.isinf(X_validation)] = np.nan
+        imputer = SimpleImputer(strategy="mean")
+        X_train = imputer.fit_transform(X_train)
+        X_validation = imputer.transform(X_validation)
+
+    if scaler == "None":
+        X_train = np.nan_to_num(
+            X_train,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        X_validation = np.nan_to_num(
+            X_validation,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+    else:
+        fitted_scaler = make_scaler(scaler, random_state=seed)
+        X_train = fitted_scaler.fit_transform(X_train)
+        X_validation = fitted_scaler.transform(X_validation)
+        X_train = np.nan_to_num(
+            X_train,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        X_validation = np.nan_to_num(
+            X_validation,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    X_train, y_train = _remove_outliers_lof(X_train, y_train)
+    return X_train, y_train, X_validation, y_validation
+
+
+def prepare_grid_folds(dataframe, dataset, scaler, seed, cv_folds):
+    """Create leak-free StratifiedKFold data from outer training rows."""
     data = dataframe.to_numpy()
     X = data[:, :-1].astype(np.float64)
     y_raw = data[:, -1]
@@ -290,41 +434,48 @@ def prepare_grid_data(dataframe, dataset, scaler, seed, validation_size):
         random_state=seed,
     )
 
-    X_train, X_validation, y_train_raw, y_validation_raw = train_test_split(
-        X_outer_train,
-        y_outer_train,
-        test_size=validation_size,
-        stratify=y_outer_train,
+    encoder = LabelEncoder()
+    y_outer_encoded = encoder.fit_transform(y_outer_train)
+
+    _, class_counts = np.unique(y_outer_encoded, return_counts=True)
+    smallest_class = int(class_counts.min())
+    if cv_folds > smallest_class:
+        raise ValueError(
+            f"cv_folds={cv_folds} is larger than the smallest outer-train "
+            f"class ({smallest_class} samples)."
+        )
+
+    splitter = StratifiedKFold(
+        n_splits=cv_folds,
+        shuffle=True,
         random_state=seed,
     )
 
-    order = y_train_raw.argsort()
-    X_train = X_train[order]
-    y_train_raw = y_train_raw[order]
+    prepared_folds = []
+    for fold_index, (train_indices, validation_indices) in enumerate(
+        splitter.split(X_outer_train, y_outer_encoded),
+        start=1,
+    ):
+        prepared = preprocess_grid_fold(
+            X_outer_train[train_indices],
+            y_outer_encoded[train_indices],
+            X_outer_train[validation_indices],
+            y_outer_encoded[validation_indices],
+            dataset,
+            scaler,
+            seed,
+        )
+        prepared_folds.append(
+            {
+                "fold": fold_index,
+                "X_train": prepared[0],
+                "y_train": prepared[1],
+                "X_validation": prepared[2],
+                "y_validation": prepared[3],
+            }
+        )
 
-    encoder = LabelEncoder()
-    y_train = encoder.fit_transform(y_train_raw)
-    y_validation = encoder.transform(y_validation_raw)
-
-    if dataset == "IoTID20":
-        X_train[np.isinf(X_train)] = np.nan
-        X_validation[np.isinf(X_validation)] = np.nan
-        imputer = SimpleImputer(strategy="mean")
-        X_train = imputer.fit_transform(X_train)
-        X_validation = imputer.transform(X_validation)
-
-    if scaler == "None":
-        X_train = np.nan_to_num(X_train, nan=0.0)
-        X_validation = np.nan_to_num(X_validation, nan=0.0)
-    else:
-        fitted_scaler = make_scaler(scaler, random_state=seed)
-        X_train = fitted_scaler.fit_transform(X_train)
-        X_validation = fitted_scaler.transform(X_validation)
-        X_train = np.nan_to_num(X_train, nan=0.0)
-        X_validation = np.nan_to_num(X_validation, nan=0.0)
-
-    X_train, y_train = _remove_outliers_lof(X_train, y_train)
-    return X_train, y_train, X_validation, y_validation
+    return prepared_folds
 
 
 def run_fixed_experiment(args, datasets, seeds, run_all):
@@ -383,6 +534,8 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
         "rff_gamma_multiplier": (
             args.rff_gamma_multiplier if args.use_rff else None
         ),
+        "classification_score": "negative_class_distance",
+        "probability_mode": "softmax_score_uncalibrated",
     }
     save_json(output_dir / "parameters.json", manifest)
 
@@ -452,8 +605,17 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
                     models.insert(1, ("RFF_LIM_NFST", rff_model))
 
                 for model_name, model in models:
+                    fit_started = perf_counter()
                     model.fit(X_train, y_train)
-                    y_pred = model.predict_closed(X_test)
+                    fit_seconds = perf_counter() - fit_started
+
+                    predict_started = perf_counter()
+                    y_pred, y_score = predict_closed_with_scores(
+                        model_name,
+                        model,
+                        X_test,
+                    )
+                    predict_seconds = perf_counter() - predict_started
 
                     if model_name == "RFF_LIM_NFST":
                         gamma_by_run[f"{dataset}__seed={seed}"] = (
@@ -465,7 +627,15 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
                         "model": model_name,
                         "seed": seed,
                     }
-                    row.update(calculate_metrics(y_test, y_pred))
+                    row.update(
+                        calculate_metrics(
+                            y_test,
+                            y_pred,
+                            y_score=y_score,
+                            fit_seconds=fit_seconds,
+                            predict_seconds=predict_seconds,
+                        )
+                    )
                     run_results.append(row)
 
                     print(
@@ -501,8 +671,8 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
 
 
 def run_grid_search(args, datasets, seeds, run_all):
-    if not 0.0 < args.validation_size < 1.0:
-        raise ValueError("--validation-size must be between zero and one.")
+    if args.cv_folds < 2:
+        raise ValueError("--cv-folds must be at least two.")
     if args.epsilon <= 0.0:
         raise ValueError("--epsilon must be greater than zero.")
     if any(
@@ -567,8 +737,16 @@ def run_grid_search(args, datasets, seeds, run_all):
             args.grid_rff_gamma_multipliers if args.use_rff else None
         ),
         "selection_metric": args.selection_metric,
-        "validation_size": args.validation_size,
+        "classification_score": "negative_reference_distance",
+        "probability_mode": "softmax_score_uncalibrated",
+        "cross_validation": "StratifiedKFold",
+        "cv_folds": args.cv_folds,
+        "cv_repeats": len(seeds),
+        "evaluations_per_configuration": args.cv_folds * len(seeds),
         "configurations_per_dataset": number_of_configurations,
+        "total_model_fits_per_dataset": (
+            number_of_configurations * args.cv_folds * len(seeds)
+        ),
         "outer_test_used_for_selection": False,
     }
     save_json(output_dir / "grid_parameters.json", manifest)
@@ -585,6 +763,17 @@ def run_grid_search(args, datasets, seeds, run_all):
         print(f"RFF dims   : {args.grid_rff_components}")
         print(f"Gamma mult : {args.grid_rff_gamma_multipliers}")
     print(f"Configs/data: {number_of_configurations}")
+    print(f"CV folds   : {args.cv_folds}")
+    print(f"CV repeats : {len(seeds)}")
+    print(
+        "Fits/config: "
+        f"{args.cv_folds * len(seeds)} "
+        "(number of folds x number of seeds)"
+    )
+    print(
+        "Fits/data  : "
+        f"{number_of_configurations * args.cv_folds * len(seeds)}"
+    )
     print(f"Metric     : {args.selection_metric}")
     print(f"Output     : {output_dir.resolve()}")
 
@@ -598,30 +787,31 @@ def run_grid_search(args, datasets, seeds, run_all):
         )
         dataframe, _ = load_dataset(dataset, limit)
 
-        # Cache preprocessing once for each scaler and seed.
-        validation_data = {}
         for scaler in args.grid_scalers:
+            # Keep only one scaler's folds in memory. Every configuration
+            # using this scaler receives exactly the same prepared folds.
+            cross_validation_data = {}
             for seed in seeds:
                 try:
-                    validation_data[(scaler, seed)] = prepare_grid_data(
+                    cross_validation_data[seed] = prepare_grid_folds(
                         dataframe,
                         dataset,
                         scaler,
                         seed,
-                        args.validation_size,
+                        args.cv_folds,
                     )
                 except Exception as error:
-                    validation_data[(scaler, seed)] = None
+                    cross_validation_data[seed] = None
                     all_errors.append(
                         {
                             "dataset": dataset,
                             "scaler": scaler,
                             "seed": seed,
+                            "stage": "cross_validation_preprocessing",
                             "error": f"{type(error).__name__}: {error}",
                         }
                     )
 
-        for scaler in args.grid_scalers:
             for rff_components, gamma_multiplier in rff_settings:
                 for reference_size in args.grid_reference_sizes:
                     for neighbors in args.grid_neighbors:
@@ -661,7 +851,16 @@ def run_grid_search(args, datasets, seeds, run_all):
                             ),
                             "rff_gamma_multiplier": gamma_multiplier,
                             "seeds": seeds,
+                            "cross_validation": "StratifiedKFold",
+                            "cv_folds": args.cv_folds,
+                            "cv_repeats": len(seeds),
                             "selection_metric": args.selection_metric,
+                            "classification_score": (
+                                "negative_reference_distance"
+                            ),
+                            "probability_mode": (
+                                "softmax_score_uncalibrated"
+                            ),
                             "lim_code_version": version,
                             "outer_test_used_for_selection": False,
                         }
@@ -672,99 +871,152 @@ def run_grid_search(args, datasets, seeds, run_all):
 
                         configuration_runs = []
                         configuration_errors = []
-                        gamma_by_seed = {}
+                        gamma_by_fold = {}
 
                         for seed in seeds:
-                            prepared_data = validation_data[(scaler, seed)]
-                            if prepared_data is None:
+                            prepared_folds = cross_validation_data[seed]
+                            if prepared_folds is None:
                                 configuration_errors.append(
                                     {
                                         "seed": seed,
+                                        "fold": None,
                                         "error": "Preprocessing failed.",
                                     }
                                 )
                                 continue
 
-                            (
-                                X_train,
-                                y_train,
-                                X_validation,
-                                y_validation,
-                            ) = prepared_data
+                            for fold_data in prepared_folds:
+                                fold_index = fold_data["fold"]
+                                X_train = fold_data["X_train"]
+                                y_train = fold_data["y_train"]
+                                X_validation = fold_data["X_validation"]
+                                y_validation = fold_data["y_validation"]
 
-                            try:
-                                model = LIM_NFST(
-                                    epsilon=args.epsilon,
-                                    reference_size=reference_size,
-                                    number_of_neighbors=neighbors,
-                                    random_state=seed,
-                                    use_rff=args.use_rff,
-                                    rff_components=(
-                                        rff_components
-                                        if args.use_rff
-                                        else 256
-                                    ),
-                                    rff_gamma_multiplier=(
-                                        gamma_multiplier
-                                        if args.use_rff
-                                        else 1.0
-                                    ),
-                                )
-                                model.fit(X_train, y_train)
-                                y_pred = model.predict_closed(X_validation)
-
-                                if args.use_rff:
-                                    gamma_by_seed[str(seed)] = (
-                                        model.rff_gamma_
-                                    )
-
-                                row = {
-                                    "dataset": dataset,
-                                    "model": model_name,
-                                    "seed": seed,
-                                }
-                                row.update(
-                                    calculate_metrics(
-                                        y_validation,
-                                        y_pred,
-                                    )
-                                )
-                                configuration_runs.append(row)
-                            except Exception as error:
-                                message = (
-                                    f"{type(error).__name__}: {error}"
-                                )
-                                configuration_errors.append(
-                                    {"seed": seed, "error": message}
-                                )
-                                all_errors.append(
-                                    {
-                                        "dataset": dataset,
-                                        "scaler": scaler,
-                                        "reference_size": reference_size,
-                                        "neighbors": neighbors,
-                                        "rff_components": rff_components,
-                                        "rff_gamma_multiplier": (
-                                            gamma_multiplier
+                                try:
+                                    model = LIM_NFST(
+                                        epsilon=args.epsilon,
+                                        reference_size=reference_size,
+                                        number_of_neighbors=neighbors,
+                                        random_state=seed,
+                                        use_rff=args.use_rff,
+                                        rff_components=(
+                                            rff_components
+                                            if args.use_rff
+                                            else 256
                                         ),
-                                        "seed": seed,
-                                        "error": message,
-                                    }
-                                )
+                                        rff_gamma_multiplier=(
+                                            gamma_multiplier
+                                            if args.use_rff
+                                            else 1.0
+                                        ),
+                                    )
+                                    fit_started = perf_counter()
+                                    model.fit(X_train, y_train)
+                                    fit_seconds = (
+                                        perf_counter() - fit_started
+                                    )
 
-                        if gamma_by_seed:
+                                    predict_started = perf_counter()
+                                    distance_matrix = (
+                                        model.reference_scores(
+                                            X_validation
+                                        )
+                                    )
+                                    predict_seconds = (
+                                        perf_counter() - predict_started
+                                    )
+                                    y_score = distances_to_scores(
+                                        distance_matrix
+                                    )
+                                    predicted_indices = np.argmax(
+                                        y_score,
+                                        axis=1,
+                                    )
+                                    y_pred = model.classes_[
+                                        predicted_indices
+                                    ]
+
+                                    if args.use_rff:
+                                        gamma_key = (
+                                            f"seed={seed}__fold={fold_index}"
+                                        )
+                                        gamma_by_fold[gamma_key] = (
+                                            model.rff_gamma_
+                                        )
+
+                                    row = {
+                                        "dataset": dataset,
+                                        "model": model_name,
+                                        "seed": seed,
+                                        "fold": fold_index,
+                                    }
+                                    row.update(
+                                        calculate_metrics(
+                                            y_validation,
+                                            y_pred,
+                                            y_score=y_score,
+                                            fit_seconds=fit_seconds,
+                                            predict_seconds=predict_seconds,
+                                        )
+                                    )
+                                    configuration_runs.append(row)
+                                except Exception as error:
+                                    message = (
+                                        f"{type(error).__name__}: {error}"
+                                    )
+                                    configuration_errors.append(
+                                        {
+                                            "seed": seed,
+                                            "fold": fold_index,
+                                            "error": message,
+                                        }
+                                    )
+                                    all_errors.append(
+                                        {
+                                            "dataset": dataset,
+                                            "scaler": scaler,
+                                            "reference_size": (
+                                                reference_size
+                                            ),
+                                            "neighbors": neighbors,
+                                            "rff_components": (
+                                                rff_components
+                                            ),
+                                            "rff_gamma_multiplier": (
+                                                gamma_multiplier
+                                            ),
+                                            "seed": seed,
+                                            "fold": fold_index,
+                                            "error": message,
+                                        }
+                                    )
+
+                        if gamma_by_fold:
                             save_json(
                                 configuration_dir
-                                / "rff_gamma_by_seed.json",
-                                gamma_by_seed,
+                                / "rff_gamma_by_fold.json",
+                                gamma_by_fold,
                             )
 
+                        pd.DataFrame(configuration_runs).to_csv(
+                            configuration_dir / "fold_results.csv",
+                            index=False,
+                            float_format="%.8f",
+                        )
                         configuration_result = average_results(
                             configuration_runs,
                             include_overall=False,
                         )
                         configuration_result.to_csv(
                             configuration_dir / "results.csv",
+                            index=False,
+                            float_format="%.8f",
+                        )
+                        cv_summary = summarize_cross_validation(
+                            configuration_runs
+                        )
+                        cv_summary.to_csv(
+                            configuration_dir / "cv_summary.csv",
                             index=False,
                             float_format="%.8f",
                         )
@@ -775,11 +1027,17 @@ def run_grid_search(args, datasets, seeds, run_all):
                                 configuration_errors,
                             )
 
-                        complete = len(configuration_runs) == len(seeds)
+                        expected_runs = len(seeds) * args.cv_folds
+                        complete = (
+                            len(configuration_runs) == expected_runs
+                        )
                         if complete and not configuration_result.empty:
                             metric_values = (
                                 configuration_result.iloc[0].to_dict()
                             )
+                            metric_standard_deviation = cv_summary.iloc[
+                                0
+                            ][f"{args.selection_metric}_std"]
 
                             report_row = {
                                 "dataset": dataset,
@@ -800,6 +1058,9 @@ def run_grid_search(args, datasets, seeds, run_all):
                                 "use_rff": args.use_rff,
                                 "rff_components": rff_components,
                                 "rff_gamma_multiplier": gamma_multiplier,
+                                "selection_metric_std": (
+                                    metric_standard_deviation
+                                ),
                             }
                             for metric in METRIC_COLUMNS:
                                 candidate[metric] = metric_values[metric]
@@ -834,6 +1095,32 @@ def run_grid_search(args, datasets, seeds, run_all):
 
     best_parameters = []
     candidate_frame = pd.DataFrame(candidates)
+    candidate_frame.to_csv(
+        output_dir / "grid_candidates.csv",
+        index=False,
+        float_format="%.8f",
+    )
+
+    if candidate_frame.empty:
+        if all_errors:
+            save_json(output_dir / "errors.json", all_errors)
+        print("No grid configuration completed every CV fold.")
+        return 2
+
+    try:
+        save_cross_validation_ranking_plots(
+            candidate_frame,
+            args.selection_metric,
+            output_dir / "plots",
+        )
+    except Exception as error:
+        all_errors.append(
+            {
+                "stage": "cross_validation_plot",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        )
+        print(f"WARNING: could not create CV ranking plots: {error}")
 
     for dataset in datasets:
         dataset_candidates = candidate_frame[
@@ -847,6 +1134,7 @@ def run_grid_search(args, datasets, seeds, run_all):
             dict.fromkeys(
                 [
                     args.selection_metric,
+                    "selection_metric_std",
                     "accuracy",
                     "mcc",
                     "reference_size",
@@ -858,12 +1146,9 @@ def run_grid_search(args, datasets, seeds, run_all):
         ranking_columns = [
             column for column in ranking_columns if column is not None
         ]
-        descending_metrics = {
-            "accuracy",
-            "balanced_accuracy",
-            "macro_f1",
-            "mcc",
-        }
+        descending_metrics = set(
+            [*CORE_METRIC_COLUMNS, *CURVE_METRIC_COLUMNS]
+        )
         dataset_candidates = dataset_candidates.sort_values(
             ranking_columns,
             ascending=[
@@ -897,6 +1182,12 @@ def run_grid_search(args, datasets, seeds, run_all):
                 ),
                 "selection_metric": args.selection_metric,
                 "validation_score": best[args.selection_metric],
+                "validation_score_std": best[
+                    "selection_metric_std"
+                ],
+                "cross_validation": "StratifiedKFold",
+                "cv_folds": args.cv_folds,
+                "cv_repeats": len(seeds),
                 "lim_code_version": version,
             }
         )
