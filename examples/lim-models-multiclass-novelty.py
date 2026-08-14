@@ -30,16 +30,14 @@ from sklearn.preprocessing import LabelEncoder
 
 CLASSIFIER_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = CLASSIFIER_ROOT.parent
-CPAI_ROOT = CLASSIFIER_ROOT / "CPAI-main" / "code"
 
 sys.path.insert(0, str(CLASSIFIER_ROOT))
-sys.path.insert(0, str(CPAI_ROOT))
 
-from cpai.datasets import DATASETS, load_dataset
-from cpai.preprocessing import (
+from limnfst.datasets import DATASETS, load_dataset
+from limnfst.preprocessing import (
     SCALERS,
-    _remove_outliers_lof,
-    _scaler as make_scaler,
+    make_scaler,
+    remove_training_outliers,
 )
 from limnfst.models import LIM_NFST
 
@@ -95,6 +93,8 @@ def get_lim_version():
         CLASSIFIER_ROOT / "limnfst" / "models.py",
         CLASSIFIER_ROOT / "limnfst" / "nfst.py",
         CLASSIFIER_ROOT / "limnfst" / "novelty.py",
+        CLASSIFIER_ROOT / "limnfst" / "datasets.py",
+        CLASSIFIER_ROOT / "limnfst" / "preprocessing.py",
     ]
     code_hash = hashlib.sha256()
     for source_file in source_files:
@@ -397,7 +397,7 @@ def encode_and_clean_training(X_train, y_train_raw):
     y_train_raw = y_train_raw[order]
     encoder = LabelEncoder()
     y_train = encoder.fit_transform(y_train_raw)
-    X_train, y_train = _remove_outliers_lof(X_train, y_train)
+    X_train, y_train = remove_training_outliers(X_train, y_train)
     return X_train, y_train, encoder
 
 

@@ -17,33 +17,27 @@ import pandas as pd
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import pairwise_distances
-from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import (
     KNeighborsClassifier,
     NearestCentroid,
     RadiusNeighborsClassifier,
 )
-from sklearn.preprocessing import LabelEncoder
 from sklearn.svm import NuSVC
 
 
 CLASSIFIER_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = CLASSIFIER_ROOT.parent
-CPAI_ROOT = WORKSPACE_ROOT / "CPAI-main" / "CPAI-main" / "code"
 
 sys.path.insert(0, str(CLASSIFIER_ROOT))
-sys.path.insert(0, str(CPAI_ROOT))
 
-from cpai.datasets import DATASETS, load_dataset
-from cpai.models import KNFST
-from cpai.preprocessing import (
+from limnfst.competitors import KNFST
+from limnfst.datasets import DATASETS, load_dataset
+from limnfst.preprocessing import (
     SCALERS,
-    _remove_outliers_lof,
-    _scaler as make_scaler,
+    preprocess_data as shared_preprocess_data,
 )
 from limnfst.mapping import center_and_normalize as center_normalize
 from limnfst.metrics import (
@@ -61,9 +55,6 @@ from limnfst.metrics import (
 from limnfst.models import LIM_NFST
 
 
-CPAI_POLY = -1
-CPAI_KERNEL = None
-CPAI_TEST_SIZE = 0.20
 LIM_VERSION_NAME = "lim_nfst_rff_cv_v2"
 
 DEFAULT_LIMITS = {
@@ -101,6 +92,8 @@ def get_lim_version():
         CLASSIFIER_ROOT / "limnfst" / "nfst.py",
         CLASSIFIER_ROOT / "limnfst" / "mapping.py",
         CLASSIFIER_ROOT / "limnfst" / "metrics.py",
+        CLASSIFIER_ROOT / "limnfst" / "datasets.py",
+        CLASSIFIER_ROOT / "limnfst" / "preprocessing.py",
         CLASSIFIER_ROOT / "examples" / "lim-models.py",
     ]
 
@@ -164,8 +157,8 @@ def parse_args():
 
     parser.add_argument(
         "--normalization-mode",
-        choices=["cpai_only", "common_lim"],
-        default="cpai_only",
+        choices=["preprocess_only", "common_lim"],
+        default="preprocess_only",
     )
     parser.add_argument("--reference-size", type=float, default=0.20)
     parser.add_argument("--reference-neighbors", type=int, default=5)
@@ -225,55 +218,19 @@ def parse_args():
 
 
 def preprocess_data(dataframe, dataset, scaler, seed):
-    """Run the same CPAI preprocessing used by lim-models.py."""
-    data = dataframe.to_numpy()
-    X = data[:, :-1].astype(np.float64)
-    y_raw = data[:, -1]
-    imputer = None
-
-    if dataset == "IoTID20":
-        X[np.isinf(X)] = np.nan
-        imputer = SimpleImputer(strategy="mean")
-        X = imputer.fit_transform(X)
-
-    X_train, X_test, y_train_raw, y_test_raw = train_test_split(
-        X,
-        y_raw,
-        test_size=CPAI_TEST_SIZE,
-        stratify=y_raw,
+    """Run the shared preprocessing owned by limnfst-classifier."""
+    return shared_preprocess_data(
+        dataframe,
+        dataset_name=dataset,
+        scaler_name=scaler,
         random_state=seed,
+        test_size=0.20,
+        return_preprocessing=True,
     )
-
-    order = y_train_raw.argsort()
-    X_train = X_train[order]
-    y_train_raw = y_train_raw[order]
-
-    encoder = LabelEncoder()
-    y_train = encoder.fit_transform(y_train_raw)
-    y_test = encoder.transform(y_test_raw)
-
-    fitted_scaler = None
-    if scaler != "None":
-        fitted_scaler = make_scaler(scaler, random_state=seed)
-        fitted_scaler.fit(X_train)
-        X_train = fitted_scaler.transform(X_train)
-        X_test = fitted_scaler.transform(X_test)
-
-    X_train = np.nan_to_num(X_train, nan=0.0)
-    X_test = np.nan_to_num(X_test, nan=0.0)
-    X_train, y_train = _remove_outliers_lof(X_train, y_train)
-
-    preprocessing = {
-        "imputer": imputer,
-        "scaler": fitted_scaler,
-        "scaler_name": scaler,
-        "feature_names": list(dataframe.columns[:-1]),
-    }
-    return X_train, y_train, X_test, y_test, encoder, preprocessing
 
 
 def normalize_data(X_train, X_test, normalization_mode):
-    if normalization_mode == "cpai_only":
+    if normalization_mode == "preprocess_only":
         return X_train, X_test
 
     with np.errstate(divide="ignore", invalid="ignore"):

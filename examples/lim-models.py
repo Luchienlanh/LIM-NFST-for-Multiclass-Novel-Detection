@@ -22,19 +22,15 @@ from sklearn.preprocessing import LabelEncoder
 
 CLASSIFIER_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = CLASSIFIER_ROOT.parent
-CPAI_ROOT = WORKSPACE_ROOT / "CPAI-main" / "CPAI-main" / "code"
-REFERENCE_ROOT = WORKSPACE_ROOT / "limnfst-reference-classifier"
 
 sys.path.insert(0, str(CLASSIFIER_ROOT))
-sys.path.insert(0, str(CPAI_ROOT))
-sys.path.insert(0, str(REFERENCE_ROOT))
 
-from cpai.datasets import DATASETS, load_dataset
-from cpai.preprocessing import (
+from limnfst.datasets import DATASETS, load_dataset
+from limnfst.preprocessing import (
     SCALERS,
-    _remove_outliers_lof,
-    _scaler as make_scaler,
-    preprocess as cpai_preprocess,
+    make_scaler,
+    preprocess_data,
+    remove_training_outliers,
 )
 from limnfst.metrics import (
     CORE_METRIC_COLUMNS,
@@ -46,12 +42,9 @@ from limnfst.metrics import (
     scores_to_probabilities,
 )
 from limnfst.models import LIM_NFST
-from reference_lim import ReferenceResidualLIM, ResidualLIM
 
 
-CPAI_POLY = -1
-CPAI_KERNEL = None
-CPAI_TEST_SIZE = 0.20
+TEST_SIZE = 0.20
 LIM_VERSION_NAME = "lim_nfst_rff_cv_v2"
 
 DEFAULT_LIMITS = {
@@ -93,6 +86,8 @@ def get_lim_version():
         CLASSIFIER_ROOT / "limnfst" / "nfst.py",
         CLASSIFIER_ROOT / "limnfst" / "mapping.py",
         CLASSIFIER_ROOT / "limnfst" / "metrics.py",
+        CLASSIFIER_ROOT / "limnfst" / "datasets.py",
+        CLASSIFIER_ROOT / "limnfst" / "preprocessing.py",
         CLASSIFIER_ROOT / "examples" / "lim-models.py",
     ]
 
@@ -296,68 +291,24 @@ def get_datasets_and_seeds(args):
 
 
 def preprocess_fixed_experiment(dataframe, dataset, scaler, seed):
-    """Use the normal CPAI train/test preprocessing pipeline."""
-    if scaler != "None":
-        return cpai_preprocess(
-            dataframe,
-            dataset_name=dataset,
-            poly=CPAI_POLY,
-            kernel=CPAI_KERNEL,
-            scaler=scaler,
-            seed=seed,
-        )
-
-    data = dataframe.to_numpy()
-    X = data[:, :-1].astype(np.float64)
-    y_raw = data[:, -1]
-
-    if dataset == "IoTID20":
-        X[np.isinf(X)] = np.nan
-        X = SimpleImputer(strategy="mean").fit_transform(X)
-
-    X_train, X_test, y_train_raw, y_test_raw = train_test_split(
-        X,
-        y_raw,
-        test_size=CPAI_TEST_SIZE,
-        stratify=y_raw,
+    """Use the shared preprocessing owned by limnfst-classifier."""
+    return preprocess_data(
+        dataframe,
+        dataset_name=dataset,
+        scaler_name=scaler,
         random_state=seed,
+        test_size=TEST_SIZE,
     )
-
-    order = y_train_raw.argsort()
-    X_train = X_train[order]
-    y_train_raw = y_train_raw[order]
-
-    encoder = LabelEncoder()
-    y_train = encoder.fit_transform(y_train_raw)
-    y_test = encoder.transform(y_test_raw)
-
-    X_train = np.nan_to_num(X_train, nan=0.0)
-    X_test = np.nan_to_num(X_test, nan=0.0)
-    X_train, y_train = _remove_outliers_lof(X_train, y_train)
-
-    return X_train, y_train, X_test, y_test, encoder
 
 
 def predict_closed_with_scores(model_name, model, X):
     """Return hard predictions and class scores where larger is better."""
-    if model_name in {"LIM_NFST", "RFF_LIM_NFST"}:
-        distances = model.reference_scores(X)
-        y_score = distances_to_scores(distances)
-        predicted_indices = np.argmax(y_score, axis=1)
-        return model.classes_[predicted_indices], y_score
-
-    if model_name == "LIM_Residual":
-        distances = model.residual_scores(X)
-        y_score = distances_to_scores(distances)
-        predicted_indices = np.argmax(y_score, axis=1)
-        return model.classes_[predicted_indices], y_score
-
-    # ReferenceResidualLIM can change an ambiguous reference decision with
-    # residual tie-breaking, so use predict_closed for labels. Reference
-    # distances remain the continuous ranking scores used by ROC/PR metrics.
-    y_pred = model.predict_closed(X)
-    y_score = distances_to_scores(model.reference_scores(X))
-    return y_pred, y_score
+    if model_name not in {"LIM_NFST", "RFF_LIM_NFST"}:
+        raise ValueError(f"Unsupported LIM model: {model_name}")
+    distances = model.reference_scores(X)
+    y_score = distances_to_scores(distances)
+    predicted_indices = np.argmax(y_score, axis=1)
+    return model.classes_[predicted_indices], y_score
 
 
 def preprocess_grid_fold(
@@ -416,7 +367,7 @@ def preprocess_grid_fold(
             neginf=0.0,
         )
 
-    X_train, y_train = _remove_outliers_lof(X_train, y_train)
+    X_train, y_train = remove_training_outliers(X_train, y_train)
     return X_train, y_train, X_validation, y_validation
 
 
@@ -429,7 +380,7 @@ def prepare_grid_folds(dataframe, dataset, scaler, seed, cv_folds):
     X_outer_train, _, y_outer_train, _ = train_test_split(
         X,
         y_raw,
-        test_size=CPAI_TEST_SIZE,
+        test_size=TEST_SIZE,
         stratify=y_raw,
         random_state=seed,
     )
@@ -579,18 +530,7 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
                     number_of_neighbors=args.neighbors,
                     random_state=seed,
                 )
-                residual_model = ResidualLIM()
-                combined_model = ReferenceResidualLIM(
-                    reference_size=args.reference_size,
-                    number_of_neighbors=args.neighbors,
-                    random_state=seed,
-                )
-
-                models = [
-                    ("LIM_NFST", lim_model),
-                    ("LIM_Residual", residual_model),
-                    ("LIM_Reference_Residual", combined_model),
-                ]
+                models = [("LIM_NFST", lim_model)]
 
                 if args.use_rff:
                     rff_model = LIM_NFST(
