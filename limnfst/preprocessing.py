@@ -22,6 +22,7 @@ SCALER_NAMES = (
     "Normalizer",
     "None",
 )
+SCALERS = SCALER_NAMES[:-1]
 
 
 def make_scaler(scaler_name, random_state):
@@ -71,22 +72,24 @@ def remove_training_outliers(X_train, y_train, contamination=0.05):
     return np.vstack(kept_X), np.concatenate(kept_y)
 
 
-def preprocess_cpai_data(
+def preprocess_data(
     dataframe,
+    dataset_name,
     scaler_name="QuantileTransformer",
     random_state=42,
     test_size=0.20,
+    return_preprocessing=False,
 ):
-    """Run the CPAI poly=-1 preprocessing path for multiclass LIM.
-
-    The only defensive addition is replacing every infinite value with NaN
-    and imputing non-finite columns for every dataset, not only IoTID20.
-    """
+    """Run the established poly=-1 preprocessing path for multiclass LIM."""
     data = dataframe.to_numpy()
     X = data[:, :-1].astype(np.float64)
     raw_y = data[:, -1]
 
-    X[~np.isfinite(X)] = np.nan
+    imputer = None
+    if dataset_name == "IoTID20":
+        X[np.isinf(X)] = np.nan
+        imputer = SimpleImputer(strategy="mean")
+        X = imputer.fit_transform(X)
 
     X_train, X_test, raw_y_train, raw_y_test = train_test_split(
         X,
@@ -96,17 +99,16 @@ def preprocess_cpai_data(
         random_state=random_state,
     )
 
-    # Fit imputation on training data only, then apply the same values to test.
-    if np.isnan(X_train).any() or np.isnan(X_test).any():
-        imputer = SimpleImputer(strategy="mean")
-        X_train = imputer.fit_transform(X_train)
-        X_test = imputer.transform(X_test)
+    order = raw_y_train.argsort()
+    X_train = X_train[order]
+    raw_y_train = raw_y_train[order]
 
     label_encoder = LabelEncoder()
     y_train = label_encoder.fit_transform(raw_y_train)
     y_test = label_encoder.transform(raw_y_test)
 
     if scaler_name == "None":
+        scaler = None
         X_train_scaled = X_train.copy()
         X_test_scaled = X_test.copy()
     else:
@@ -132,10 +134,20 @@ def preprocess_cpai_data(
         X_train_scaled,
         y_train,
     )
-    return (
+    result = (
         X_train_clean,
         y_train_clean,
         X_test_scaled,
         y_test,
         label_encoder,
     )
+    if not return_preprocessing:
+        return result
+
+    preprocessing = {
+        "imputer": imputer,
+        "scaler": scaler,
+        "scaler_name": scaler_name,
+        "feature_names": list(dataframe.columns[:-1]),
+    }
+    return (*result, preprocessing)
