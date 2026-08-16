@@ -1,0 +1,22 @@
+{
+  "mode": "fixed RFF-REF-LIM MND evaluation",
+  "model_display_name": "RFF-REF-LIM",
+  "version": "rff_ref_lim_mnd_fixed_v1_20471671",
+  "dataset": "BoT_IoT",
+  "limit": 1000,
+  "seed": 42,
+  "novel_class": null,
+  "scaler": "StandardScaler",
+  "test_size": 0.2,
+  "reference_size": 0.2,
+  "neighbors": 5,
+  "epsilon": 0.0001,
+  "use_rff": true,
+  "rff_components": 256,
+  "rff_gamma": "scale_times_multiplier",
+  "rff_gamma_multiplier": 1.0,
+  "threshold_mode": "quantile",
+  "novelty_quantile": 0.95,
+  "paper_delta": null,
+  "paper_threshold_tau": null
+}

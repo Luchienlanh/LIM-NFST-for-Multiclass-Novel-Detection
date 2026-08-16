@@ -62,6 +62,7 @@ DEFAULT_GRID_SCALERS = list(SCALERS)
 DEFAULT_GRID_REFERENCE_SIZES = [0.10, 0.15, 0.20, 0.25, 0.30]
 DEFAULT_GRID_NEIGHBORS = [1, 3, 5, 7, 9]
 DEFAULT_GRID_NOVELTY_QUANTILES = [0.90, 0.95, 0.99]
+DEFAULT_GRID_DELTAS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
 DEFAULT_GRID_RFF_COMPONENTS = [128, 256, 512]
 DEFAULT_GRID_RFF_GAMMA_MULTIPLIERS = [0.10, 1.0, 10.0]
 
@@ -79,6 +80,13 @@ METRIC_COLUMNS = [
     "mcc_with_novel",
 ]
 RESULT_COLUMNS = ["dataset", "model", "test_set", *METRIC_COLUMNS]
+NOVEL_CLASS_RESULT_COLUMNS = [
+    "dataset",
+    "model",
+    "novel_class",
+    "test_set",
+    *METRIC_COLUMNS,
+]
 SELECTION_METRICS = [
     "novel_detection_f1",
     "macro_f1",
@@ -146,7 +154,10 @@ def parse_args():
     parser.add_argument(
         "--novel-class",
         default=None,
-        help="Held-out label or zero-based class index (default: first class).",
+        help=(
+            "Run one held-out label or zero-based class index. "
+            "By default, every class is held out once and metrics are averaged."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seeds", type=int, nargs="+", default=None)
@@ -161,7 +172,17 @@ def parse_args():
     parser.add_argument("--reference-size", type=float, default=0.20)
     parser.add_argument("--neighbors", type=int, default=5)
     parser.add_argument("--epsilon", type=float, default=1e-4)
+    parser.add_argument(
+        "--threshold-mode",
+        choices=["quantile", "delta"],
+        default="quantile",
+        help=(
+            "quantile: adaptive threshold per class; "
+            "delta: global threshold tau=(delta/2)^2."
+        ),
+    )
     parser.add_argument("--novelty-quantile", type=float, default=0.95)
+    parser.add_argument("--delta", dest="novelty_delta", type=float, default=2.0)
     rff_group = parser.add_mutually_exclusive_group()
     rff_group.add_argument(
         "--use-rff",
@@ -202,6 +223,12 @@ def parse_args():
         nargs="+",
         type=float,
         default=DEFAULT_GRID_NOVELTY_QUANTILES,
+    )
+    parser.add_argument(
+        "--grid-deltas",
+        nargs="+",
+        type=float,
+        default=DEFAULT_GRID_DELTAS,
     )
     parser.add_argument(
         "--grid-rff-components",
@@ -329,6 +356,22 @@ def average_results(run_results, include_overall=True):
     return results[RESULT_COLUMNS]
 
 
+def average_results_by_novel_class(run_results):
+    """Average seeds separately for every held-out novel class."""
+    if not run_results:
+        return pd.DataFrame(columns=NOVEL_CLASS_RESULT_COLUMNS)
+    runs = pd.DataFrame(run_results)
+    results = (
+        runs.groupby(
+            ["dataset", "model", "novel_class", "test_set"],
+            sort=False,
+        )[METRIC_COLUMNS]
+        .mean()
+        .reset_index()
+    )
+    return results[NOVEL_CLASS_RESULT_COLUMNS]
+
+
 def resolve_novel_class(y_raw, requested_class):
     """Resolve an exact raw label first, then a zero-based class index."""
     classes = np.unique(y_raw)
@@ -352,6 +395,17 @@ def resolve_novel_class(y_raw, requested_class):
             f"[0, {len(classes) - 1}]."
         )
     return classes[class_index]
+
+
+def resolve_novel_classes(dataframe, requested_class):
+    """Return one requested class or every class for full LOCO evaluation."""
+    y_raw = dataframe.iloc[:, -1].to_numpy()
+    if requested_class is not None:
+        return [resolve_novel_class(y_raw, requested_class)]
+    classes = np.unique(y_raw)
+    if len(classes) < 2:
+        raise ValueError("MND requires at least two classes.")
+    return classes.tolist()
 
 
 def split_loco_data(dataframe, requested_novel_class):
@@ -470,6 +524,7 @@ def make_model(
     reference_size,
     neighbors,
     novelty_quantile,
+    novelty_delta,
     rff_components=None,
     gamma_multiplier=None,
 ):
@@ -477,7 +532,17 @@ def make_model(
         epsilon=args.epsilon,
         reference_size=reference_size,
         number_of_neighbors=neighbors,
-        novelty_quantile=novelty_quantile,
+        novelty_quantile=(
+            novelty_quantile
+            if novelty_quantile is not None
+            else args.novelty_quantile
+        ),
+        threshold_mode=args.threshold_mode,
+        novelty_delta=(
+            novelty_delta
+            if novelty_delta is not None
+            else args.novelty_delta
+        ),
         random_state=seed,
         use_rff=args.use_rff,
         rff_components=(
@@ -508,6 +573,7 @@ def evaluate_model(
     dataset,
     model_name,
     seed,
+    novel_class,
     X_known,
     y_known,
     X_novel,
@@ -535,6 +601,7 @@ def evaluate_model(
             "model": model_name,
             "test_set": test_set,
             "seed": seed,
+            "novel_class": str(novel_class),
         }
         row.update(calculate_metrics(y_true, y_open, y_closed))
         rows.append(row)
@@ -548,8 +615,12 @@ def validate_fixed_arguments(args):
         raise ValueError("--neighbors must be at least one.")
     if args.epsilon <= 0.0:
         raise ValueError("--epsilon must be greater than zero.")
-    if not 0.0 < args.novelty_quantile < 1.0:
+    if args.threshold_mode == "quantile" and not (
+        0.0 < args.novelty_quantile < 1.0
+    ):
         raise ValueError("--novelty-quantile must be between zero and one.")
+    if args.threshold_mode == "delta" and args.novelty_delta <= 0.0:
+        raise ValueError("--delta must be greater than zero.")
     if args.use_rff and args.rff_components < 1:
         raise ValueError("--rff-components must be at least one.")
     if args.use_rff and args.rff_gamma_multiplier <= 0.0:
@@ -564,8 +635,13 @@ def fixed_output_dir(args, datasets, run_all, version):
         f"evaluation__dataset={dataset_name}__scaler={args.scaler}"
         f"__reference_size={number_to_name(args.reference_size)}"
         f"__neighbors={args.neighbors}"
-        f"__novelty_quantile={number_to_name(args.novelty_quantile)}"
     )
+    if args.threshold_mode == "quantile":
+        folder_name += (
+            f"__threshold=quantile-{number_to_name(args.novelty_quantile)}"
+        )
+    else:
+        folder_name += f"__threshold=delta-{number_to_name(args.novelty_delta)}"
     if args.novel_class is not None:
         folder_name += f"__novel_class={safe_name(args.novel_class)}"
     if args.use_rff:
@@ -598,12 +674,26 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
         "datasets": datasets,
         "seeds": seeds,
         "novel_class": args.novel_class,
-        "novel_class_default": "first sorted class",
+        "novel_class_default": "all classes (full LOCO)",
+        "metrics_aggregation": "equal mean across novel classes and seeds",
         "scaler": args.scaler,
         "reference_size": args.reference_size,
         "neighbors": args.neighbors,
         "epsilon": args.epsilon,
-        "novelty_quantile": args.novelty_quantile,
+        "threshold_mode": args.threshold_mode,
+        "novelty_quantile": (
+            args.novelty_quantile
+            if args.threshold_mode == "quantile"
+            else None
+        ),
+        "novelty_delta": (
+            args.novelty_delta if args.threshold_mode == "delta" else None
+        ),
+        "fixed_threshold": (
+            0.25 * args.novelty_delta**2
+            if args.threshold_mode == "delta"
+            else None
+        ),
         "use_rff": args.use_rff,
         "rff_components": args.rff_components if args.use_rff else None,
         "rff_gamma_mode": "scale_times_multiplier" if args.use_rff else None,
@@ -621,11 +711,16 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
     print(f"Version    : {version}")
     print(f"Datasets   : {datasets}")
     print(f"Seeds      : {seeds}")
-    print(f"Novel class: {args.novel_class or 'first sorted class'}")
+    print(f"Novel class: {args.novel_class or 'all classes (full LOCO)'}")
     print(f"Scaler     : {args.scaler}")
     print(f"Reference  : {args.reference_size}")
     print(f"Neighbors  : {args.neighbors}")
-    print(f"Quantile   : {args.novelty_quantile}")
+    print(f"Threshold  : {args.threshold_mode}")
+    if args.threshold_mode == "quantile":
+        print(f"Quantile   : {args.novelty_quantile}")
+    else:
+        print(f"Delta      : {args.novelty_delta}")
+        print(f"Tau        : {0.25 * args.novelty_delta**2}")
     print(f"Use RFF    : {args.use_rff}")
     if args.use_rff:
         print(f"RFF dims   : {args.rff_components}")
@@ -641,57 +736,73 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
             args.limit or DEFAULT_LIMITS[dataset]
         )
         dataframe, _ = load_dataset(dataset, limit)
-        for seed in seeds:
-            try:
-                prepared = prepare_fixed_data(
-                    dataframe, args.novel_class, args.scaler, seed
-                )
-                X_train, y_train, X_known, y_known, X_novel, novel_class = (
-                    prepared
-                )
-                resolved_novel_classes[dataset] = novel_class
-                model = make_model(
-                    args,
-                    seed,
-                    args.reference_size,
-                    args.neighbors,
-                    args.novelty_quantile,
-                    args.rff_components,
-                    args.rff_gamma_multiplier,
-                )
-                model.fit(X_train, y_train)
-                result_rows = evaluate_model(
-                    model,
-                    dataset,
-                    model_name,
-                    seed,
-                    X_known,
-                    y_known,
-                    X_novel,
-                )
-                run_results.extend(result_rows)
-                if args.use_rff:
-                    gamma_by_run[f"{dataset}__seed={seed}"] = model.rff_gamma_
-                combined = result_rows[1]
-                print(
-                    f"dataset={dataset} seed={seed} model={model_name} "
-                    f"novel_class={novel_class} "
-                    f"accuracy={combined['accuracy_with_novel']:.4f} "
-                    f"novel_f1={combined['novel_detection_f1']:.4f}"
-                )
-            except Exception as error:
-                errors.append(
-                    {
-                        "dataset": dataset,
-                        "seed": seed,
-                        "error": f"{type(error).__name__}: {error}",
-                    }
-                )
-                print(f"FAILED dataset={dataset} seed={seed}: {error}")
+        novel_classes = resolve_novel_classes(dataframe, args.novel_class)
+        resolved_novel_classes[dataset] = [str(value) for value in novel_classes]
+        for novel_class in novel_classes:
+            for seed in seeds:
+                try:
+                    prepared = prepare_fixed_data(
+                        dataframe, novel_class, args.scaler, seed
+                    )
+                    X_train, y_train, X_known, y_known, X_novel, _ = prepared
+                    model = make_model(
+                        args,
+                        seed,
+                        args.reference_size,
+                        args.neighbors,
+                        args.novelty_quantile,
+                        args.novelty_delta,
+                        args.rff_components,
+                        args.rff_gamma_multiplier,
+                    )
+                    model.fit(X_train, y_train)
+                    result_rows = evaluate_model(
+                        model,
+                        dataset,
+                        model_name,
+                        seed,
+                        novel_class,
+                        X_known,
+                        y_known,
+                        X_novel,
+                    )
+                    run_results.extend(result_rows)
+                    if args.use_rff:
+                        gamma_key = (
+                            f"{dataset}__novel={safe_name(novel_class)}"
+                            f"__seed={seed}"
+                        )
+                        gamma_by_run[gamma_key] = model.rff_gamma_
+                    combined = result_rows[1]
+                    print(
+                        f"dataset={dataset} seed={seed} model={model_name} "
+                        f"novel_class={novel_class} "
+                        f"accuracy={combined['accuracy_with_novel']:.4f} "
+                        f"novel_f1={combined['novel_detection_f1']:.4f}"
+                    )
+                except Exception as error:
+                    errors.append(
+                        {
+                            "dataset": dataset,
+                            "novel_class": str(novel_class),
+                            "seed": seed,
+                            "error": f"{type(error).__name__}: {error}",
+                        }
+                    )
+                    print(
+                        f"FAILED dataset={dataset} novel_class={novel_class} "
+                        f"seed={seed}: {error}"
+                    )
 
     results = average_results(run_results)
+    class_results = average_results_by_novel_class(run_results)
     results.to_csv(
         output_dir / "results.csv", index=False, float_format="%.8f"
+    )
+    class_results.to_csv(
+        output_dir / "results_by_novel_class.csv",
+        index=False,
+        float_format="%.8f",
     )
     save_json(output_dir / "novel_classes.json", resolved_novel_classes)
     if errors:
@@ -715,11 +826,15 @@ def validate_grid_arguments(args):
         raise ValueError("Grid reference sizes must be in (0, 0.30].")
     if any(value < 1 for value in args.grid_neighbors):
         raise ValueError("Grid neighbors must be at least one.")
-    if any(
+    if args.threshold_mode == "quantile" and any(
         value <= 0.0 or value >= 1.0
         for value in args.grid_novelty_quantiles
     ):
         raise ValueError("Grid novelty quantiles must be between zero and one.")
+    if args.threshold_mode == "delta" and any(
+        value <= 0.0 for value in args.grid_deltas
+    ):
+        raise ValueError("Grid deltas must be greater than zero.")
     if args.use_rff and any(
         value < 1 for value in args.grid_rff_components
     ):
@@ -733,13 +848,25 @@ def validate_grid_arguments(args):
 
 
 def configuration_name(config, use_rff):
-    scaler, reference_size, neighbors, quantile, components, gamma = config
+    (
+        scaler,
+        reference_size,
+        neighbors,
+        threshold_mode,
+        quantile,
+        delta,
+        components,
+        gamma,
+    ) = config
     name = (
         f"scaler={scaler}"
         f"__reference_size={number_to_name(reference_size)}"
         f"__neighbors={neighbors}"
-        f"__novelty_quantile={number_to_name(quantile)}"
     )
+    if threshold_mode == "quantile":
+        name += f"__threshold=quantile-{number_to_name(quantile)}"
+    else:
+        name += f"__threshold=delta-{number_to_name(delta)}"
     if use_rff:
         name += (
             f"__rff_components={components}"
@@ -755,12 +882,25 @@ def configuration_payload(
     novel_class,
     validation_size,
 ):
-    scaler, reference_size, neighbors, quantile, components, gamma = config
+    (
+        scaler,
+        reference_size,
+        neighbors,
+        threshold_mode,
+        quantile,
+        delta,
+        components,
+        gamma,
+    ) = config
     return {
         "scaler": scaler,
         "reference_size": float(reference_size),
         "neighbors": int(neighbors),
-        "novelty_quantile": float(quantile),
+        "threshold_mode": threshold_mode,
+        "novelty_quantile": (
+            float(quantile) if quantile is not None else None
+        ),
+        "novelty_delta": float(delta) if delta is not None else None,
         "epsilon": float(epsilon),
         "use_rff": bool(use_rff),
         "rff_components": int(components) if use_rff else None,
@@ -790,11 +930,22 @@ def configuration_id(
 
 
 def config_from_parameters(parameters):
+    threshold_mode = parameters.get("threshold_mode", "quantile")
     return (
         parameters["scaler"],
         float(parameters["reference_size"]),
         int(parameters["neighbors"]),
-        float(parameters["novelty_quantile"]),
+        threshold_mode,
+        (
+            float(parameters["novelty_quantile"])
+            if parameters.get("novelty_quantile") is not None
+            else None
+        ),
+        (
+            float(parameters["novelty_delta"])
+            if parameters.get("novelty_delta") is not None
+            else None
+        ),
         (
             int(parameters["rff_components"])
             if parameters.get("use_rff")
@@ -904,20 +1055,47 @@ def grid_configurations(args):
         if args.use_rff
         else [(None, None)]
     )
+    threshold_settings = (
+        [("quantile", value, None) for value in args.grid_novelty_quantiles]
+        if args.threshold_mode == "quantile"
+        else [("delta", None, value) for value in args.grid_deltas]
+    )
     return [
-        (scaler, reference_size, neighbors, quantile, components, gamma)
-        for scaler, reference_size, neighbors, quantile, (components, gamma)
+        (
+            scaler,
+            reference_size,
+            neighbors,
+            threshold_mode,
+            quantile,
+            delta,
+            components,
+            gamma,
+        )
+        for (
+            scaler,
+            reference_size,
+            neighbors,
+            (threshold_mode, quantile, delta),
+            (components, gamma),
+        )
         in product(
             args.grid_scalers,
             args.grid_reference_sizes,
             args.grid_neighbors,
-            args.grid_novelty_quantiles,
+            threshold_settings,
             rff_settings,
         )
     ]
 
 
-SEED_RESULT_COLUMNS = ["dataset", "model", "test_set", "seed", *METRIC_COLUMNS]
+SEED_RESULT_COLUMNS = [
+    "dataset",
+    "model",
+    "novel_class",
+    "test_set",
+    "seed",
+    *METRIC_COLUMNS,
+]
 
 
 def save_csv_atomic(frame, path):
@@ -938,7 +1116,16 @@ def summarize_configuration(
     combined = results[results["test_set"] == "with_novel_class"]
     if combined.empty:
         return None, []
-    scaler, reference_size, neighbors, quantile, components, gamma = config
+    (
+        scaler,
+        reference_size,
+        neighbors,
+        threshold_mode,
+        quantile,
+        delta,
+        components,
+        gamma,
+    ) = config
     metrics = combined.iloc[0]
     candidate = {
         "dataset": dataset,
@@ -946,7 +1133,12 @@ def summarize_configuration(
         "scaler": scaler,
         "reference_size": reference_size,
         "neighbors": neighbors,
+        "threshold_mode": threshold_mode,
         "novelty_quantile": quantile,
+        "novelty_delta": delta,
+        "fixed_threshold": (
+            0.25 * delta**2 if threshold_mode == "delta" else None
+        ),
         "epsilon": args.epsilon,
         "use_rff": args.use_rff,
         "rff_components": components,
@@ -992,7 +1184,13 @@ def load_completed_configuration(config_dir, seeds):
     return results[RESULT_COLUMNS]
 
 
-def load_seed_checkpoint(config_dir, dataset, model_name, seeds):
+def load_seed_checkpoint(
+    config_dir,
+    dataset,
+    model_name,
+    seeds,
+    novel_classes,
+):
     checkpoint_path = config_dir / "seed_results.csv"
     if not checkpoint_path.exists():
         return [], set()
@@ -1007,16 +1205,28 @@ def load_seed_checkpoint(config_dir, dataset, model_name, seeds):
         & (checkpoint["model"] == model_name)
         & checkpoint["seed"].isin(seeds)
     ].copy()
-    completed_seeds = set()
-    for seed in seeds:
-        seed_rows = checkpoint[checkpoint["seed"] == seed]
-        if set(seed_rows["test_set"].astype(str)) == {
-            "known_only",
-            "with_novel_class",
-        }:
-            completed_seeds.add(int(seed))
-    checkpoint = checkpoint[checkpoint["seed"].isin(completed_seeds)]
-    return checkpoint[SEED_RESULT_COLUMNS].to_dict("records"), completed_seeds
+    checkpoint["novel_class"] = checkpoint["novel_class"].astype(str)
+    requested_classes = {str(value) for value in novel_classes}
+    checkpoint = checkpoint[checkpoint["novel_class"].isin(requested_classes)]
+    completed_runs = set()
+    for novel_class in requested_classes:
+        for seed in seeds:
+            run_rows = checkpoint[
+                (checkpoint["novel_class"] == novel_class)
+                & (checkpoint["seed"] == seed)
+            ]
+            if set(run_rows["test_set"].astype(str)) == {
+                "known_only",
+                "with_novel_class",
+            }:
+                completed_runs.add((novel_class, int(seed)))
+    complete_mask = checkpoint.apply(
+        lambda row: (str(row["novel_class"]), int(row["seed"]))
+        in completed_runs,
+        axis=1,
+    )
+    checkpoint = checkpoint[complete_mask]
+    return checkpoint[SEED_RESULT_COLUMNS].to_dict("records"), completed_runs
 
 
 def save_configuration_result(
@@ -1027,17 +1237,31 @@ def save_configuration_result(
     seeds,
     config,
     output_dir,
-    prepared_by_seed,
-    novel_class,
+    prepared_by_run,
+    novel_classes,
     all_errors,
 ):
-    scaler, reference_size, neighbors, quantile, components, gamma = config
+    (
+        scaler,
+        reference_size,
+        neighbors,
+        threshold_mode,
+        quantile,
+        delta,
+        components,
+        gamma,
+    ) = config
     display_name = configuration_name(config, args.use_rff)
+    novel_scope = (
+        str(novel_classes[0])
+        if len(novel_classes) == 1
+        else "ALL_CLASSES"
+    )
     short_name = configuration_id(
         config,
         args.use_rff,
         args.epsilon,
-        novel_class,
+        novel_scope,
         args.validation_size,
     )
     config_dir = output_dir / dataset / short_name
@@ -1048,11 +1272,17 @@ def save_configuration_result(
         "dataset": dataset,
         "model": model_name,
         "novel_class": args.novel_class,
-        "resolved_novel_class": novel_class,
+        "resolved_novel_classes": [str(value) for value in novel_classes],
+        "loco_scope": novel_scope,
         "scaler": scaler,
         "reference_size": reference_size,
         "neighbors": neighbors,
+        "threshold_mode": threshold_mode,
         "novelty_quantile": quantile,
+        "novelty_delta": delta,
+        "fixed_threshold": (
+            0.25 * delta**2 if threshold_mode == "delta" else None
+        ),
         "epsilon": args.epsilon,
         "use_rff": args.use_rff,
         "rff_components": components,
@@ -1075,18 +1305,24 @@ def save_configuration_result(
                 dataset,
                 model_name,
                 display_name,
-                novel_class,
+                novel_scope,
                 config,
                 args,
             )
 
     save_json(config_dir / "parameters.json", parameters)
-    runs, completed_seeds = (
+    runs, completed_runs = (
         ([], set())
         if args.force
-        else load_seed_checkpoint(config_dir, dataset, model_name, seeds)
+        else load_seed_checkpoint(
+            config_dir,
+            dataset,
+            model_name,
+            seeds,
+            novel_classes,
+        )
     )
-    gamma_path = config_dir / "rff_gamma_by_seed.json"
+    gamma_path = config_dir / "rff_gamma_by_run.json"
     if not args.force and gamma_path.exists():
         try:
             gamma_by_seed = json.loads(gamma_path.read_text(encoding="utf-8"))
@@ -1096,74 +1332,103 @@ def save_configuration_result(
         gamma_by_seed = {}
     errors = []
 
-    for seed in seeds:
-        if int(seed) in completed_seeds:
-            print(
-                f"RESUME seed dataset={dataset} configuration={short_name} "
-                f"seed={seed}"
-            )
-            continue
-        prepared = prepared_by_seed.get(seed)
-        if prepared is None:
-            errors.append({"seed": seed, "error": "Preprocessing failed."})
-            continue
-        X_train, y_train, X_known, y_known, X_novel, _ = prepared
-        try:
-            model = make_model(
-                args,
-                seed,
-                reference_size,
-                neighbors,
-                quantile,
-                components,
-                gamma,
-            )
-            model.fit(X_train, y_train)
-            runs.extend(
-                evaluate_model(
-                    model,
-                    dataset,
-                    model_name,
-                    seed,
-                    X_known,
-                    y_known,
-                    X_novel,
+    for novel_class in novel_classes:
+        novel_key = str(novel_class)
+        for seed in seeds:
+            run_key = (novel_key, int(seed))
+            if run_key in completed_runs:
+                print(
+                    f"RESUME dataset={dataset} configuration={short_name} "
+                    f"novel_class={novel_class} seed={seed}"
                 )
-            )
-            completed_seeds.add(int(seed))
-            save_csv_atomic(
-                pd.DataFrame(runs, columns=SEED_RESULT_COLUMNS),
-                config_dir / "seed_results.csv",
-            )
-            if args.use_rff:
-                gamma_by_seed[str(seed)] = model.rff_gamma_
-                save_json(gamma_path, gamma_by_seed)
-        except Exception as error:
-            message = f"{type(error).__name__}: {error}"
-            error_row = {"seed": seed, "error": message}
-            errors.append(error_row)
-            all_errors.append(
-                {
-                    "dataset": dataset,
-                    "configuration_id": short_name,
-                    "scaler": scaler,
-                    "reference_size": reference_size,
-                    "neighbors": neighbors,
-                    "novelty_quantile": quantile,
-                    "rff_components": components,
-                    "rff_gamma_multiplier": gamma,
-                    **error_row,
+                continue
+            prepared = prepared_by_run.get(run_key)
+            if prepared is None:
+                errors.append(
+                    {
+                        "novel_class": novel_key,
+                        "seed": seed,
+                        "error": "Preprocessing failed.",
+                    }
+                )
+                continue
+            X_train, y_train, X_known, y_known, X_novel, _ = prepared
+            try:
+                model = make_model(
+                    args,
+                    seed,
+                    reference_size,
+                    neighbors,
+                    quantile,
+                    delta,
+                    components,
+                    gamma,
+                )
+                model.fit(X_train, y_train)
+                runs.extend(
+                    evaluate_model(
+                        model,
+                        dataset,
+                        model_name,
+                        seed,
+                        novel_class,
+                        X_known,
+                        y_known,
+                        X_novel,
+                    )
+                )
+                completed_runs.add(run_key)
+                save_csv_atomic(
+                    pd.DataFrame(runs, columns=SEED_RESULT_COLUMNS),
+                    config_dir / "seed_results.csv",
+                )
+                if args.use_rff:
+                    gamma_by_seed[
+                        f"novel={safe_name(novel_class)}__seed={seed}"
+                    ] = model.rff_gamma_
+                    save_json(gamma_path, gamma_by_seed)
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                error_row = {
+                    "novel_class": novel_key,
+                    "seed": seed,
+                    "error": message,
                 }
-            )
+                errors.append(error_row)
+                all_errors.append(
+                    {
+                        "dataset": dataset,
+                        "configuration_id": short_name,
+                        "scaler": scaler,
+                        "reference_size": reference_size,
+                        "neighbors": neighbors,
+                        "threshold_mode": threshold_mode,
+                        "novelty_quantile": quantile,
+                        "novelty_delta": delta,
+                        "rff_components": components,
+                        "rff_gamma_multiplier": gamma,
+                        **error_row,
+                    }
+                )
 
     results = average_results(runs, include_overall=False)
+    class_results = average_results_by_novel_class(runs)
     save_csv_atomic(results, config_dir / "results.csv")
+    save_csv_atomic(
+        class_results,
+        config_dir / "results_by_novel_class.csv",
+    )
     errors_path = config_dir / "errors.json"
     if errors:
         save_json(errors_path, errors)
     elif errors_path.exists():
         errors_path.unlink()
-    if completed_seeds != {int(seed) for seed in seeds}:
+    expected_runs = {
+        (str(novel_class), int(seed))
+        for novel_class in novel_classes
+        for seed in seeds
+    }
+    if completed_runs != expected_runs:
         print(f"FAILED dataset={dataset} configuration={short_name}")
         return None, []
 
@@ -1172,14 +1437,18 @@ def save_configuration_result(
         dataset,
         model_name,
         display_name,
-        novel_class,
+        novel_scope,
         config,
         args,
     )
     message = (
         f"dataset={dataset} config={short_name} scaler={scaler} "
-        f"ref={reference_size:g} k={neighbors} quantile={quantile:g}"
+        f"ref={reference_size:g} k={neighbors}"
     )
+    if threshold_mode == "quantile":
+        message += f" quantile={quantile:g}"
+    else:
+        message += f" delta={delta:g} tau={0.25 * delta**2:g}"
     if args.use_rff:
         message += f" rff={components} gamma_mult={gamma:g}"
     if candidate is not None:
@@ -1205,7 +1474,11 @@ def select_best_parameters(args, datasets, candidates, version):
                 "mcc_with_novel",
                 "reference_size",
                 "neighbors",
-                "novelty_quantile",
+                (
+                    "novelty_quantile"
+                    if args.threshold_mode == "quantile"
+                    else "novelty_delta"
+                ),
                 "rff_components" if args.use_rff else None,
             ]
         )
@@ -1230,7 +1503,10 @@ def select_best_parameters(args, datasets, candidates, version):
                 "scaler": best["scaler"],
                 "reference_size": best["reference_size"],
                 "neighbors": int(best["neighbors"]),
+                "threshold_mode": best["threshold_mode"],
                 "novelty_quantile": best["novelty_quantile"],
+                "novelty_delta": best["novelty_delta"],
+                "fixed_threshold": best["fixed_threshold"],
                 "epsilon": float(best["epsilon"]),
                 "use_rff": args.use_rff,
                 "rff_components": (
@@ -1276,11 +1552,20 @@ def run_grid_search(args, datasets, seeds, run_all):
         "datasets": datasets,
         "seeds": seeds,
         "novel_class": args.novel_class,
-        "novel_class_default": "first sorted class",
+        "novel_class_default": "all classes (full LOCO)",
+        "metrics_aggregation": "equal mean across novel classes and seeds",
         "scalers": args.grid_scalers,
         "reference_sizes": args.grid_reference_sizes,
         "neighbors": args.grid_neighbors,
-        "novelty_quantiles": args.grid_novelty_quantiles,
+        "threshold_mode": args.threshold_mode,
+        "novelty_quantiles": (
+            args.grid_novelty_quantiles
+            if args.threshold_mode == "quantile"
+            else None
+        ),
+        "novelty_deltas": (
+            args.grid_deltas if args.threshold_mode == "delta" else None
+        ),
         "epsilon": args.epsilon,
         "use_rff": args.use_rff,
         "rff_components": args.grid_rff_components if args.use_rff else None,
@@ -1295,7 +1580,7 @@ def run_grid_search(args, datasets, seeds, run_all):
         "outer_test_used_for_selection": False,
         "resume_enabled": not args.force,
         "configuration_directory_schema": "cfg_<sha256-prefix-12>",
-        "seed_checkpoint_file": "seed_results.csv",
+        "run_checkpoint_file": "seed_results.csv",
     }
     save_json(output_dir / "grid_parameters.json", manifest)
 
@@ -1307,11 +1592,15 @@ def run_grid_search(args, datasets, seeds, run_all):
     print(f"Version    : {version}")
     print(f"Datasets   : {datasets}")
     print(f"Seeds      : {seeds}")
-    print(f"Novel class: {args.novel_class or 'first sorted class'}")
+    print(f"Novel class: {args.novel_class or 'all classes (full LOCO)'}")
     print(f"Scalers    : {args.grid_scalers}")
     print(f"Ref sizes  : {args.grid_reference_sizes}")
     print(f"Neighbors  : {args.grid_neighbors}")
-    print(f"Quantiles  : {args.grid_novelty_quantiles}")
+    print(f"Threshold  : {args.threshold_mode}")
+    if args.threshold_mode == "quantile":
+        print(f"Quantiles  : {args.grid_novelty_quantiles}")
+    else:
+        print(f"Deltas     : {args.grid_deltas}")
     print(f"Use RFF    : {args.use_rff}")
     if args.use_rff:
         print(f"RFF dims   : {args.grid_rff_components}")
@@ -1353,29 +1642,34 @@ def run_grid_search(args, datasets, seeds, run_all):
             args.limit or DEFAULT_LIMITS[dataset]
         )
         dataframe, _ = load_dataset(dataset, limit)
+        novel_classes = resolve_novel_classes(dataframe, args.novel_class)
+        resolved_novel_classes[dataset] = [
+            str(value) for value in novel_classes
+        ]
         for scaler in args.grid_scalers:
-            prepared_by_seed = {}
-            for seed in seeds:
-                try:
-                    prepared = prepare_grid_data(
-                        dataframe,
-                        args.novel_class,
-                        scaler,
-                        seed,
-                        args.validation_size,
-                    )
-                    prepared_by_seed[seed] = prepared
-                    resolved_novel_classes[dataset] = prepared[-1]
-                except Exception as error:
-                    prepared_by_seed[seed] = None
-                    all_errors.append(
-                        {
-                            "dataset": dataset,
-                            "scaler": scaler,
-                            "seed": seed,
-                            "error": f"{type(error).__name__}: {error}",
-                        }
-                    )
+            prepared_by_run = {}
+            for novel_class in novel_classes:
+                for seed in seeds:
+                    run_key = (str(novel_class), int(seed))
+                    try:
+                        prepared_by_run[run_key] = prepare_grid_data(
+                            dataframe,
+                            novel_class,
+                            scaler,
+                            seed,
+                            args.validation_size,
+                        )
+                    except Exception as error:
+                        prepared_by_run[run_key] = None
+                        all_errors.append(
+                            {
+                                "dataset": dataset,
+                                "scaler": scaler,
+                                "novel_class": str(novel_class),
+                                "seed": seed,
+                                "error": f"{type(error).__name__}: {error}",
+                            }
+                        )
 
             scaler_configs = [
                 config for config in configurations if config[0] == scaler
@@ -1389,8 +1683,8 @@ def run_grid_search(args, datasets, seeds, run_all):
                     seeds,
                     config,
                     output_dir,
-                    prepared_by_seed,
-                    resolved_novel_classes.get(dataset),
+                    prepared_by_run,
+                    novel_classes,
                     all_errors,
                 )
                 if candidate is not None:

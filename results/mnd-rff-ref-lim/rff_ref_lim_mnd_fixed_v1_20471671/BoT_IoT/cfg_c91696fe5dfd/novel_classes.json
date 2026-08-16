@@ -1,0 +1,10 @@
+{
+  "BoT_IoT": [
+    "0Normal",
+    "HTTP",
+    "TCP",
+    "UDP",
+    "scan",
+    "theft"
+  ]
+}

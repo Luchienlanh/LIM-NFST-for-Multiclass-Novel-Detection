@@ -6,6 +6,7 @@ from sklearn.model_selection import train_test_split
 
 from .mapping import center_and_normalize, center_projection
 from .nfst import train_lim_projection
+from .novelty import get_threshold
 
 
 class LIM_NFST:
@@ -15,6 +16,8 @@ class LIM_NFST:
         reference_size=0.20,
         number_of_neighbors=5,
         novelty_quantile=0.95,
+        threshold_mode="quantile",
+        novelty_delta=2.0,
         random_state=42,
         use_rff=False,
         rff_components=256,
@@ -24,10 +27,21 @@ class LIM_NFST:
         self.reference_size = float(reference_size)
         self.number_of_neighbors = int(number_of_neighbors)
         self.novelty_quantile = float(novelty_quantile)
+        self.threshold_mode = str(threshold_mode)
+        self.novelty_delta = float(novelty_delta)
         self.random_state = int(random_state)
         self.use_rff = bool(use_rff)
         self.rff_components = int(rff_components)
         self.rff_gamma_multiplier = float(rff_gamma_multiplier)
+
+        if self.threshold_mode not in {"quantile", "delta"}:
+            raise ValueError("threshold_mode must be 'quantile' or 'delta'.")
+        if self.threshold_mode == "quantile" and not (
+            0.0 < self.novelty_quantile < 1.0
+        ):
+            raise ValueError("novelty_quantile must be between zero and one.")
+        if self.threshold_mode == "delta" and self.novelty_delta <= 0.0:
+            raise ValueError("novelty_delta must be greater than zero.")
 
         # This remains None until fit() finishes learning the projection.
         self.projection_matrix_ = None
@@ -210,7 +224,10 @@ class LIM_NFST:
         return nearest_distances.mean(axis=1)
 
     def _calculate_reference_threshold(self, class_reference_points):
-        """Calibrate a class novelty threshold by leave-one-out distances."""
+        """Calculate either an adaptive quantile or global delta threshold."""
+        if self.threshold_mode == "delta":
+            return get_threshold(self.novelty_delta)
+
         leave_one_out_scores = self._mean_nearest_distance(
             class_reference_points,
             class_reference_points,

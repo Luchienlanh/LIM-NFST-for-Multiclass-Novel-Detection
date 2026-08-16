@@ -1,0 +1,77 @@
+{
+  "mode": "RFF_LIM_NFST MND grid search",
+  "model_display_name": "RFF-REF-LIM",
+  "model_implementation": "LIM_NFST",
+  "lim_code_version": "rff_ref_lim_multiclass_novelty_v1_66a636ba",
+  "datasets": [
+    "BoT_IoT",
+    "ToN_IoT",
+    "N_BaIoT",
+    "UNSW_NB15",
+    "CIC_IoT2023",
+    "IoTID20",
+    "Edge_IIoTset",
+    "5G_NIDD"
+  ],
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "novel_class": null,
+  "novel_class_default": "all classes (full LOCO)",
+  "metrics_aggregation": "equal mean across novel classes and seeds",
+  "scalers": [
+    "QuantileTransformer",
+    "StandardScaler",
+    "MinMaxScaler",
+    "RobustScaler",
+    "Normalizer"
+  ],
+  "reference_sizes": [
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.3
+  ],
+  "neighbors": [
+    1,
+    3,
+    5,
+    7,
+    9
+  ],
+  "threshold_mode": "delta",
+  "novelty_quantiles": null,
+  "novelty_deltas": [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5
+  ],
+  "epsilon": 0.0001,
+  "use_rff": true,
+  "rff_components": [
+    128,
+    256,
+    512
+  ],
+  "rff_gamma_mode": "scale_times_multiplier",
+  "rff_gamma_multipliers": [
+    0.1,
+    1.0,
+    10.0
+  ],
+  "selection_metric": "novel_detection_f1",
+  "selection_test_set": "with_novel_class",
+  "validation_size": 0.2,
+  "configurations_per_dataset": 5625,
+  "outer_test_used_for_selection": false,
+  "resume_enabled": true,
+  "configuration_directory_schema": "cfg_<sha256-prefix-12>",
+  "run_checkpoint_file": "seed_results.csv"
+}

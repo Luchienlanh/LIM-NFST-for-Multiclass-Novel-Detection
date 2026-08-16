@@ -1,0 +1,40 @@
+{
+  "configuration_id": "cfg_e6a5edb94a66",
+  "configuration_name": "scaler=QuantileTransformer__reference_size=0p1__neighbors=3__threshold=quantile-0p95__rff_components=256__rff_gamma_multiplier=0p1",
+  "dataset": "BoT_IoT",
+  "model": "RFF_LIM_NFST",
+  "novel_class": null,
+  "resolved_novel_classes": [
+    "0Normal",
+    "HTTP",
+    "TCP",
+    "UDP",
+    "scan",
+    "theft"
+  ],
+  "loco_scope": "ALL_CLASSES",
+  "scaler": "QuantileTransformer",
+  "reference_size": 0.1,
+  "neighbors": 3,
+  "threshold_mode": "quantile",
+  "novelty_quantile": 0.95,
+  "novelty_delta": null,
+  "fixed_threshold": null,
+  "epsilon": 0.0001,
+  "use_rff": true,
+  "rff_components": 256,
+  "rff_gamma_mode": "scale_times_multiplier",
+  "rff_gamma_multiplier": 0.1,
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "validation_size": 0.2,
+  "selection_metric": "novel_detection_f1",
+  "selection_test_set": "with_novel_class",
+  "lim_code_version": "rff_ref_lim_multiclass_novelty_v1_66a636ba",
+  "outer_test_used_for_selection": false
+}
