@@ -115,27 +115,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    if args.limit is not None and args.limit < 1:
-        raise ValueError("--limit must be at least one.")
-    if not 0.0 < args.reference_size <= 0.30:
-        raise ValueError("--reference-size must be in (0, 0.30].")
-    if args.neighbors < 1:
-        raise ValueError("--neighbors must be at least one.")
-    if args.epsilon <= 0.0:
-        raise ValueError("--epsilon must be greater than zero.")
-    if args.rff_components < 1:
-        raise ValueError("--rff-components must be at least one.")
-    if args.rff_gamma_multiplier <= 0.0:
-        raise ValueError("--rff-gamma-multiplier must be greater than zero.")
-    if not 0.0 < args.novelty_quantile < 1.0:
-        raise ValueError("--novelty-quantile must be between zero and one.")
-
-
 def resolve_novel_class(y_raw: np.ndarray, requested_class: object) -> object:
     classes = np.unique(y_raw)
-    if len(classes) < 2:
-        raise ValueError("MND requires at least two classes.")
     if requested_class is None:
         return classes[0]
 
@@ -143,18 +124,7 @@ def resolve_novel_class(y_raw: np.ndarray, requested_class: object) -> object:
     if matching_labels:
         return matching_labels[0]
 
-    try:
-        class_index = int(requested_class)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            f"Unknown novel class {requested_class!r}. "
-            f"Available classes: {classes.tolist()}"
-        ) from error
-    if not 0 <= class_index < len(classes):
-        raise ValueError(
-            f"Novel class index {class_index} is outside [0, {len(classes) - 1}]."
-        )
-    return classes[class_index]
+    return classes[int(requested_class)]
 
 
 def resolve_novel_classes(
@@ -164,8 +134,6 @@ def resolve_novel_classes(
     labels = dataframe.iloc[:, -1].to_numpy()
     if requested_class is not None:
         return [resolve_novel_class(labels, requested_class)]
-    if len(np.unique(labels)) < 2:
-        raise ValueError("MND requires at least two classes.")
     return np.unique(labels).tolist()
 
 
@@ -262,11 +230,6 @@ def calculate_metrics(
         average="macro",
         zero_division=0,
     )
-    mcc = (
-        matthews_corrcoef(y_true, y_pred_open)
-        if len(np.unique(y_true)) > 1 and len(np.unique(y_pred_open)) > 1
-        else 0.0
-    )
     return {
         "accuracy_with_novel": accuracy_score(y_true, y_pred_open),
         "accuracy_closed_world": closed_accuracy,
@@ -284,7 +247,7 @@ def calculate_metrics(
         "macro_precision": macro_precision,
         "macro_recall": macro_recall,
         "macro_f1": macro_f1,
-        "mcc_with_novel": mcc,
+        "mcc_with_novel": matthews_corrcoef(y_true, y_pred_open),
     }
 
 
@@ -322,8 +285,6 @@ def evaluate_model(
 
 
 def output_dir(args: argparse.Namespace, version: str) -> Path:
-    if args.output_dir is not None:
-        return args.output_dir
     configuration = {
         "limit": args.limit or DEFAULT_LIMITS[args.dataset],
         "novel_class": args.novel_class,
@@ -341,7 +302,7 @@ def output_dir(args: argparse.Namespace, version: str) -> Path:
     configuration_id = hashlib.sha256(
         json.dumps(configuration, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:12]
-    return (
+    default_output_dir = (
         CLASSIFIER_ROOT
         / "results"
         / "mnd-rff-ref-lim"
@@ -349,6 +310,7 @@ def output_dir(args: argparse.Namespace, version: str) -> Path:
         / args.dataset
         / f"cfg_{configuration_id}"
     )
+    return args.output_dir or default_output_dir
 
 
 def parameters_payload(args: argparse.Namespace, version: str) -> dict[str, object]:
@@ -378,7 +340,6 @@ def parameters_payload(args: argparse.Namespace, version: str) -> dict[str, obje
 
 def main() -> int:
     args = parse_args()
-    validate_args(args)
     version = get_version()
     results_dir = output_dir(args, version)
     results_dir.mkdir(parents=True, exist_ok=True)

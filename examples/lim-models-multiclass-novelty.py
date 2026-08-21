@@ -584,21 +584,6 @@ def evaluate_model(
     return rows
 
 
-def validate_fixed_arguments(args):
-    if not 0.0 < args.reference_size <= 0.30:
-        raise ValueError("--reference-size must be in (0, 0.30].")
-    if args.neighbors < 1:
-        raise ValueError("--neighbors must be at least one.")
-    if args.epsilon <= 0.0:
-        raise ValueError("--epsilon must be greater than zero.")
-    if not 0.0 < args.novelty_quantile < 1.0:
-        raise ValueError("--novelty-quantile must be between zero and one.")
-    if args.use_rff and args.rff_components < 1:
-        raise ValueError("--rff-components must be at least one.")
-    if args.use_rff and args.rff_gamma_multiplier <= 0.0:
-        raise ValueError("--rff-gamma-multiplier must be greater than zero.")
-
-
 def fixed_output_dir(args, datasets, run_all, version):
     if args.output_dir is not None:
         return args.output_dir
@@ -628,7 +613,6 @@ def fixed_output_dir(args, datasets, run_all, version):
 
 
 def run_fixed_experiment(args, datasets, seeds, run_all):
-    validate_fixed_arguments(args)
     version = get_lim_version()
     output_dir = fixed_output_dir(args, datasets, run_all, version)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -766,35 +750,6 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
     print("\nFinal results:")
     print(results.to_string(index=False))
     return 0 if not errors else 2
-
-
-def validate_grid_arguments(args):
-    if not 0.0 < args.validation_size < 1.0:
-        raise ValueError("--validation-size must be between zero and one.")
-    if args.epsilon <= 0.0:
-        raise ValueError("--epsilon must be greater than zero.")
-    if any(
-        value <= 0.0 or value > 0.30
-        for value in args.grid_reference_sizes
-    ):
-        raise ValueError("Grid reference sizes must be in (0, 0.30].")
-    if any(value < 1 for value in args.grid_neighbors):
-        raise ValueError("Grid neighbors must be at least one.")
-    if any(
-        value <= 0.0 or value >= 1.0
-        for value in args.grid_novelty_quantiles
-    ):
-        raise ValueError("Grid novelty quantiles must be between zero and one.")
-    if args.use_rff and any(
-        value < 1 for value in args.grid_rff_components
-    ):
-        raise ValueError("Grid RFF components must be at least one.")
-    if args.use_rff and any(
-        value <= 0.0 for value in args.grid_rff_gamma_multipliers
-    ):
-        raise ValueError(
-            "Grid RFF gamma multipliers must be greater than zero."
-        )
 
 
 def configuration_name(config, use_rff):
@@ -1356,7 +1311,6 @@ def select_best_parameters(args, datasets, candidates, version):
 
 
 def run_grid_search(args, datasets, seeds, run_all):
-    validate_grid_arguments(args)
     version = get_lim_version()
     grid_mode = "rff" if args.use_rff else "no-rff"
     output_dir = args.output_dir or (

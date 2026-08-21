@@ -30,71 +30,34 @@ class LIM_NFST:
         self.rff_components = int(rff_components)
         self.rff_gamma_multiplier = float(rff_gamma_multiplier)
 
-        if not 0.0 < self.novelty_quantile < 1.0:
-            raise ValueError("novelty_quantile must be between zero and one.")
-        if self.epsilon <= 0.0:
-            raise ValueError("epsilon must be greater than zero.")
-        if not 0.0 < self.reference_size < 1.0:
-            raise ValueError("reference_size must be between zero and one.")
-        if self.number_of_neighbors < 1:
-            raise ValueError("number_of_neighbors must be at least one.")
-
-        # This remains None until fit() finishes learning the projection.
         self.projection_matrix_ = None
         self.rff_mapper_ = None
         self.rff_gamma_ = None
 
     def _calculate_rff_gamma(self, X):
         """Calculate gamma='scale', then apply the configured multiplier."""
-        variance = float(np.var(X))
-        if not np.isfinite(variance) or variance <= 0.0:
-            raise ValueError(
-                "Cannot calculate RFF gamma because training variance is "
-                f"{variance}."
-            )
-
-        scale_gamma = 1.0 / (X.shape[1] * variance)
-        return scale_gamma * self.rff_gamma_multiplier
+        return self.rff_gamma_multiplier / (X.shape[1] * np.var(X))
 
     def _fit_rff(self, X):
         """Fit the optional RFF map and return the model input features."""
-        if not self.use_rff:
-            self.rff_mapper_ = None
-            self.rff_gamma_ = None
-            return X
-
-        if self.rff_components < 1:
-            raise ValueError("rff_components must be at least one.")
-        if self.rff_gamma_multiplier <= 0.0:
-            raise ValueError("rff_gamma_multiplier must be greater than zero.")
-
-        self.rff_gamma_ = self._calculate_rff_gamma(X)
-        self.rff_mapper_ = RBFSampler(
-            gamma=self.rff_gamma_,
-            n_components=self.rff_components,
-            random_state=self.random_state,
-        )
-        return self.rff_mapper_.fit_transform(X)
+        if self.use_rff:
+            self.rff_gamma_ = self._calculate_rff_gamma(X)
+            self.rff_mapper_ = RBFSampler(
+                gamma=self.rff_gamma_,
+                n_components=self.rff_components,
+                random_state=self.random_state,
+            )
+            return self.rff_mapper_.fit_transform(X)
+        return X
 
     def _apply_rff(self, X):
         """Apply the fitted RFF map, or keep the original features."""
-        if not self.use_rff:
-            return X
-        if self.rff_mapper_ is None:
-            raise RuntimeError("Call fit before applying RFF.")
-        return self.rff_mapper_.transform(X)
+        return self.rff_mapper_.transform(X) if self.use_rff else X
 
     def fit(self, X, y):
         """Learn the LIM projection and build one reference cloud per class."""
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y)
-
-        if X.ndim != 2:
-            raise ValueError("X must be a two-dimensional matrix.")
-        if len(X) != len(y):
-            raise ValueError("X and y must contain the same number of samples.")
-        if not np.isfinite(X).all():
-            raise ValueError("X contains NaN or infinite values.")
 
         self.n_features_in_ = X.shape[1]
         X = self._fit_rff(X)
@@ -163,17 +126,7 @@ class LIM_NFST:
 
     def transform(self, X):
         """Apply optional RFF and project into the c-dimensional LIM space."""
-        if self.projection_matrix_ is None:
-            raise RuntimeError("Call fit before transform.")
-
         X = np.asarray(X, dtype=np.float64)
-        if X.ndim != 2:
-            raise ValueError("X must be a two-dimensional matrix.")
-        if X.shape[1] != self.n_features_in_:
-            raise ValueError(
-                f"Expected {self.n_features_in_} features, got {X.shape[1]}."
-            )
-
         X = self._apply_rff(X)
         return self._project_model_features(X)
 

@@ -431,17 +431,6 @@ def prepare_grid_folds(dataframe, dataset, scaler, seed, cv_folds):
 
 
 def run_fixed_experiment(args, datasets, seeds, run_all):
-    if not 0.0 < args.reference_size <= 0.30:
-        raise ValueError("--reference-size must be in (0, 0.30].")
-    if args.neighbors < 1:
-        raise ValueError("--neighbors must be at least one.")
-    if args.epsilon <= 0.0:
-        raise ValueError("--epsilon must be greater than zero.")
-    if args.use_rff and args.rff_components < 1:
-        raise ValueError("--rff-components must be at least one.")
-    if args.use_rff and args.rff_gamma_multiplier <= 0.0:
-        raise ValueError("--rff-gamma-multiplier must be greater than zero.")
-
     version = get_lim_version()
     dataset_name = "all" if run_all else datasets[0]
 
@@ -612,28 +601,6 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
 
 
 def run_grid_search(args, datasets, seeds, run_all):
-    if args.cv_folds < 2:
-        raise ValueError("--cv-folds must be at least two.")
-    if args.epsilon <= 0.0:
-        raise ValueError("--epsilon must be greater than zero.")
-    if any(
-        value <= 0.0 or value > 0.30
-        for value in args.grid_reference_sizes
-    ):
-        raise ValueError("Grid reference sizes must be in (0, 0.30].")
-    if any(value < 1 for value in args.grid_neighbors):
-        raise ValueError("Grid neighbors must be at least one.")
-    if args.use_rff and any(
-        value < 1 for value in args.grid_rff_components
-    ):
-        raise ValueError("Grid RFF components must be at least one.")
-    if args.use_rff and any(
-        value <= 0.0 for value in args.grid_rff_gamma_multipliers
-    ):
-        raise ValueError(
-            "Grid RFF gamma multipliers must be greater than zero."
-        )
-
     version = get_lim_version()
     grid_mode = "rff" if args.use_rff else "no-rff"
     output_dir = args.output_dir or (

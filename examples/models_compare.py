@@ -261,42 +261,10 @@ def load_best_parameters(
     current_version,
     parameter_source,
 ):
-    if not file_path.exists():
-        raise FileNotFoundError(
-            f"Cannot find {file_path}. Run lim-models.py --grid-search first."
-        )
-
-    parameters = pd.read_csv(file_path)
-    required_columns = {
-        "dataset",
-        "scaler",
-        "reference_size",
-        "neighbors",
-        "lim_code_version",
-    }
-    if parameter_source == "rff_ref":
-        required_columns.update(
-            {
-                "rff_components",
-                "rff_gamma_mode",
-                "rff_gamma_multiplier",
-            }
-        )
-    missing_columns = required_columns - set(parameters.columns)
-    if missing_columns:
-        raise ValueError(
-            f"best_parameters.csv is missing: {sorted(missing_columns)}"
-        )
-    if parameters["dataset"].duplicated().any():
-        raise ValueError("best_parameters.csv contains duplicate datasets.")
-
+    parameters = pd.read_csv(file_path).set_index("dataset")
     result = {}
     for dataset in datasets:
-        selected = parameters[parameters["dataset"] == dataset]
-        if selected.empty:
-            raise ValueError(f"No best parameters found for {dataset}.")
-
-        row = selected.iloc[0]
+        row = parameters.loc[dataset]
         stored_version = str(row["lim_code_version"])
         if stored_version != current_version:
             raise ValueError(
@@ -309,15 +277,6 @@ def load_best_parameters(
         reference_size = float(row["reference_size"])
         neighbors = int(row["neighbors"])
 
-        if scaler not in [*SCALERS, "None"]:
-            raise ValueError(f"Invalid scaler for {dataset}: {scaler}")
-        if not 0.0 < reference_size <= 0.30:
-            raise ValueError(
-                f"Invalid reference size for {dataset}: {reference_size}"
-            )
-        if neighbors < 1:
-            raise ValueError(f"Invalid neighbors for {dataset}: {neighbors}")
-
         dataset_parameters = {
             "scaler": scaler,
             "reference_size": reference_size,
@@ -329,33 +288,8 @@ def load_best_parameters(
         }
 
         if parameter_source == "rff_ref":
-            if "use_rff" in parameters.columns:
-                stored_use_rff = str(row["use_rff"]).lower()
-                if stored_use_rff not in {"true", "1"}:
-                    raise ValueError(
-                        f"RFF parameters for {dataset} have use_rff="
-                        f"{row['use_rff']}"
-                    )
-            rff_gamma_mode = str(row["rff_gamma_mode"])
-            if rff_gamma_mode != "scale_times_multiplier":
-                raise ValueError(
-                    f"Unsupported RFF gamma mode for {dataset}: "
-                    f"{rff_gamma_mode}"
-                )
-
             rff_components = int(row["rff_components"])
             gamma_multiplier = float(row["rff_gamma_multiplier"])
-            if rff_components < 1:
-                raise ValueError(
-                    f"Invalid RFF components for {dataset}: "
-                    f"{rff_components}"
-                )
-            if gamma_multiplier <= 0.0:
-                raise ValueError(
-                    f"Invalid RFF gamma multiplier for {dataset}: "
-                    f"{gamma_multiplier}"
-                )
-
             dataset_parameters["rff_components"] = rff_components
             dataset_parameters["rff_gamma_multiplier"] = gamma_multiplier
 
@@ -954,14 +888,6 @@ def main():
     args = parse_args()
     run_all = args.all_datasets or args.dataset is None
 
-    if args.single_sample_repeats < 1:
-        raise ValueError("--single-sample-repeats must be at least one.")
-    if args.single_sample_warmup < 0:
-        raise ValueError("--single-sample-warmup cannot be negative.")
-
-    if run_all and args.limit is not None:
-        raise ValueError("--limit can only be used with one --dataset.")
-
     datasets = list(DATASETS) if run_all else [args.dataset]
 
     if args.seeds is not None:
@@ -990,18 +916,6 @@ def main():
             f"best-grid-parameters__source={args.best_parameter_source}"
         )
     else:
-        if not 0.0 < args.reference_size <= 0.30:
-            raise ValueError("--reference-size must be in (0, 0.30].")
-        if args.reference_neighbors < 1:
-            raise ValueError("--reference-neighbors must be at least one.")
-        if args.best_parameter_source == "rff_ref":
-            if args.rff_components < 1:
-                raise ValueError("--rff-components must be at least one.")
-            if args.rff_gamma_multiplier <= 0.0:
-                raise ValueError(
-                    "--rff-gamma-multiplier must be greater than zero."
-                )
-
         parameters_by_dataset = {
             dataset: {
                 "scaler": args.scaler,
