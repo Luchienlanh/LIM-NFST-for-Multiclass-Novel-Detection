@@ -1,3 +1,0 @@
-dataset,model,test_set,accuracy_with_novel,accuracy_closed_world,balanced_accuracy_with_novel,balanced_accuracy_closed_world,novel_detection_precision,novel_detection_recall,novel_detection_f1,macro_precision,macro_recall,macro_f1,mcc_with_novel
-BoT_IoT,RFF_LIM_NFST,known_only,0.96103825,0.98618616,0.96299418,0.98628236,0.00000000,0.00000000,0.00000000,0.82869615,0.80249515,0.81522962,0.95207754
-BoT_IoT,RFF_LIM_NFST,with_novel_class,0.90086803,0.98618616,0.91945473,0.98628236,0.79619421,0.70175747,0.71568736,0.90180304,0.91945473,0.89605203,0.88782279

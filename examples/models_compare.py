@@ -90,6 +90,7 @@ def get_lim_version():
     source_files = [
         CLASSIFIER_ROOT / "limnfst" / "models.py",
         CLASSIFIER_ROOT / "limnfst" / "nfst.py",
+        CLASSIFIER_ROOT / "limnfst" / "novelty.py",
         CLASSIFIER_ROOT / "limnfst" / "mapping.py",
         CLASSIFIER_ROOT / "limnfst" / "metrics.py",
         CLASSIFIER_ROOT / "limnfst" / "datasets.py",
@@ -105,6 +106,26 @@ def get_lim_version():
     return f"{LIM_VERSION_NAME}_{code_hash.hexdigest()[:8]}"
 
 
+def get_comparison_version():
+    source_files = [
+        Path(__file__),
+        CLASSIFIER_ROOT / "limnfst" / "competitors.py",
+        CLASSIFIER_ROOT / "limnfst" / "models.py",
+        CLASSIFIER_ROOT / "limnfst" / "nfst.py",
+        CLASSIFIER_ROOT / "limnfst" / "novelty.py",
+        CLASSIFIER_ROOT / "limnfst" / "mapping.py",
+        CLASSIFIER_ROOT / "limnfst" / "metrics.py",
+        CLASSIFIER_ROOT / "limnfst" / "datasets.py",
+        CLASSIFIER_ROOT / "limnfst" / "preprocessing.py",
+        CLASSIFIER_ROOT / "examples" / "lim-models.py",
+    ]
+    code_hash = hashlib.sha256()
+    for source_file in source_files:
+        code_hash.update(source_file.name.encode("utf-8"))
+        code_hash.update(source_file.read_bytes())
+    return f"{LIM_VERSION_NAME}_{code_hash.hexdigest()[:8]}"
+
+
 def number_to_name(value):
     return format(float(value), ".6g").replace(".", "p")
 
@@ -112,19 +133,7 @@ def number_to_name(value):
 def find_default_best_parameters_file(parameter_source, current_version):
     grid_mode = "no-rff" if parameter_source == "lim_ref" else "rff"
     root = WORKSPACE_ROOT / "results" / "lim-models"
-    exact_file = root / current_version / grid_mode / "best_parameters.csv"
-    if exact_file.exists():
-        return exact_file
-
-    available_files = list(root.glob(f"*/{grid_mode}/best_parameters.csv"))
-    if parameter_source == "lim_ref":
-        available_files.extend(root.glob("*/best_parameters.csv"))
-    else:
-        legacy_root = WORKSPACE_ROOT / "results" / "rff-ref-lim"
-        available_files.extend(legacy_root.glob("*/best_parameters.csv"))
-    if available_files:
-        return max(available_files, key=lambda path: path.stat().st_mtime)
-    return exact_file
+    return root / current_version / grid_mode / "best_parameters.csv"
 
 
 def save_json(path, data):
@@ -290,9 +299,10 @@ def load_best_parameters(
         row = selected.iloc[0]
         stored_version = str(row["lim_code_version"])
         if stored_version != current_version:
-            print(
-                f"WARNING: {dataset} parameters use {stored_version}, "
-                f"current LIM version is {current_version}."
+            raise ValueError(
+                f"{dataset} parameters use LIM version {stored_version}, "
+                f"but the current LIM version is {current_version}. "
+                "Run lim-models.py --grid-search again before comparing."
             )
 
         scaler = str(row["scaler"])
@@ -961,18 +971,19 @@ def main():
     else:
         seeds = [args.seed]
 
-    version = get_lim_version()
+    lim_version = get_lim_version()
+    comparison_version = get_comparison_version()
     if args.best_parameters_file is None:
         args.best_parameters_file = find_default_best_parameters_file(
             args.best_parameter_source,
-            version,
+            lim_version,
         )
 
     if args.lim_parameter_mode == "best":
         parameters_by_dataset = load_best_parameters(
             args.best_parameters_file,
             datasets,
-            version,
+            lim_version,
             args.best_parameter_source,
         )
         parameter_name = (
@@ -1066,7 +1077,7 @@ def main():
         )
         output_dir = (
             result_root
-            / version
+            / comparison_version
             / experiment_folder
         )
         if args.artifacts_only and not (output_dir / "artifacts").exists():
@@ -1096,7 +1107,7 @@ def main():
     save_json(
         output_dir / "parameters.json",
         {
-            "lim_code_version": version,
+            "lim_code_version": lim_version,
             "datasets": datasets,
             "models": model_names,
             "seeds": seeds,
@@ -1382,7 +1393,7 @@ def main():
                                 "model_name": model_name,
                                 "model": model,
                                 "seed": seed,
-                                "lim_code_version": version,
+                                "lim_code_version": lim_version,
                                 "best_parameters": parameters,
                                 "normalization_mode": (
                                     args.normalization_mode

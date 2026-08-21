@@ -1,2 +1,0 @@
-dataset,model,test_set,accuracy_with_novel,novel_detection_precision,novel_detection_recall,novel_detection_f1,macro_precision,macro_recall,macro_f1,mcc_with_novel
-BoT_IoT,RFF-REF-LIM,combined,0.85380559,0.90458894,0.80535092,0.83969497,0.89455722,0.89897714,0.87542088,0.81732843

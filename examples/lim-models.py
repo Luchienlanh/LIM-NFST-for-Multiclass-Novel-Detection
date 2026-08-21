@@ -84,6 +84,7 @@ def get_lim_version():
     source_files = [
         CLASSIFIER_ROOT / "limnfst" / "models.py",
         CLASSIFIER_ROOT / "limnfst" / "nfst.py",
+        CLASSIFIER_ROOT / "limnfst" / "novelty.py",
         CLASSIFIER_ROOT / "limnfst" / "mapping.py",
         CLASSIFIER_ROOT / "limnfst" / "metrics.py",
         CLASSIFIER_ROOT / "limnfst" / "datasets.py",

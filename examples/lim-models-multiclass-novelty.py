@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import sys
 from itertools import product
 from pathlib import Path
@@ -29,7 +28,6 @@ from sklearn.preprocessing import LabelEncoder
 
 
 CLASSIFIER_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = CLASSIFIER_ROOT.parent
 
 sys.path.insert(0, str(CLASSIFIER_ROOT))
 
@@ -62,7 +60,6 @@ DEFAULT_GRID_SCALERS = list(SCALERS)
 DEFAULT_GRID_REFERENCE_SIZES = [0.10, 0.15, 0.20, 0.25, 0.30]
 DEFAULT_GRID_NEIGHBORS = [1, 3, 5, 7, 9]
 DEFAULT_GRID_NOVELTY_QUANTILES = [0.90, 0.95, 0.99]
-DEFAULT_GRID_DELTAS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
 DEFAULT_GRID_RFF_COMPONENTS = [128, 256, 512]
 DEFAULT_GRID_RFF_GAMMA_MULTIPLIERS = [0.10, 1.0, 10.0]
 
@@ -98,9 +95,11 @@ SELECTION_METRICS = [
 
 def get_lim_version():
     source_files = [
+        Path(__file__),
         CLASSIFIER_ROOT / "limnfst" / "models.py",
         CLASSIFIER_ROOT / "limnfst" / "nfst.py",
         CLASSIFIER_ROOT / "limnfst" / "novelty.py",
+        CLASSIFIER_ROOT / "limnfst" / "mapping.py",
         CLASSIFIER_ROOT / "limnfst" / "datasets.py",
         CLASSIFIER_ROOT / "limnfst" / "preprocessing.py",
     ]
@@ -172,17 +171,7 @@ def parse_args():
     parser.add_argument("--reference-size", type=float, default=0.20)
     parser.add_argument("--neighbors", type=int, default=5)
     parser.add_argument("--epsilon", type=float, default=1e-4)
-    parser.add_argument(
-        "--threshold-mode",
-        choices=["quantile", "delta"],
-        default="quantile",
-        help=(
-            "quantile: adaptive threshold per class; "
-            "delta: global threshold tau=(delta/2)^2."
-        ),
-    )
     parser.add_argument("--novelty-quantile", type=float, default=0.95)
-    parser.add_argument("--delta", dest="novelty_delta", type=float, default=2.0)
     rff_group = parser.add_mutually_exclusive_group()
     rff_group.add_argument(
         "--use-rff",
@@ -223,12 +212,6 @@ def parse_args():
         nargs="+",
         type=float,
         default=DEFAULT_GRID_NOVELTY_QUANTILES,
-    )
-    parser.add_argument(
-        "--grid-deltas",
-        nargs="+",
-        type=float,
-        default=DEFAULT_GRID_DELTAS,
     )
     parser.add_argument(
         "--grid-rff-components",
@@ -524,7 +507,6 @@ def make_model(
     reference_size,
     neighbors,
     novelty_quantile,
-    novelty_delta,
     rff_components=None,
     gamma_multiplier=None,
 ):
@@ -536,12 +518,6 @@ def make_model(
             novelty_quantile
             if novelty_quantile is not None
             else args.novelty_quantile
-        ),
-        threshold_mode=args.threshold_mode,
-        novelty_delta=(
-            novelty_delta
-            if novelty_delta is not None
-            else args.novelty_delta
         ),
         random_state=seed,
         use_rff=args.use_rff,
@@ -615,12 +591,8 @@ def validate_fixed_arguments(args):
         raise ValueError("--neighbors must be at least one.")
     if args.epsilon <= 0.0:
         raise ValueError("--epsilon must be greater than zero.")
-    if args.threshold_mode == "quantile" and not (
-        0.0 < args.novelty_quantile < 1.0
-    ):
+    if not 0.0 < args.novelty_quantile < 1.0:
         raise ValueError("--novelty-quantile must be between zero and one.")
-    if args.threshold_mode == "delta" and args.novelty_delta <= 0.0:
-        raise ValueError("--delta must be greater than zero.")
     if args.use_rff and args.rff_components < 1:
         raise ValueError("--rff-components must be at least one.")
     if args.use_rff and args.rff_gamma_multiplier <= 0.0:
@@ -636,12 +608,9 @@ def fixed_output_dir(args, datasets, run_all, version):
         f"__reference_size={number_to_name(args.reference_size)}"
         f"__neighbors={args.neighbors}"
     )
-    if args.threshold_mode == "quantile":
-        folder_name += (
-            f"__threshold=quantile-{number_to_name(args.novelty_quantile)}"
-        )
-    else:
-        folder_name += f"__threshold=delta-{number_to_name(args.novelty_delta)}"
+    folder_name += (
+        f"__threshold=quantile-{number_to_name(args.novelty_quantile)}"
+    )
     if args.novel_class is not None:
         folder_name += f"__novel_class={safe_name(args.novel_class)}"
     if args.use_rff:
@@ -680,20 +649,10 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
         "reference_size": args.reference_size,
         "neighbors": args.neighbors,
         "epsilon": args.epsilon,
-        "threshold_mode": args.threshold_mode,
-        "novelty_quantile": (
-            args.novelty_quantile
-            if args.threshold_mode == "quantile"
-            else None
-        ),
-        "novelty_delta": (
-            args.novelty_delta if args.threshold_mode == "delta" else None
-        ),
-        "fixed_threshold": (
-            0.25 * args.novelty_delta**2
-            if args.threshold_mode == "delta"
-            else None
-        ),
+        "threshold_mode": "quantile",
+        "novelty_quantile": args.novelty_quantile,
+        "novelty_delta": None,
+        "fixed_threshold": None,
         "use_rff": args.use_rff,
         "rff_components": args.rff_components if args.use_rff else None,
         "rff_gamma_mode": "scale_times_multiplier" if args.use_rff else None,
@@ -715,12 +674,8 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
     print(f"Scaler     : {args.scaler}")
     print(f"Reference  : {args.reference_size}")
     print(f"Neighbors  : {args.neighbors}")
-    print(f"Threshold  : {args.threshold_mode}")
-    if args.threshold_mode == "quantile":
-        print(f"Quantile   : {args.novelty_quantile}")
-    else:
-        print(f"Delta      : {args.novelty_delta}")
-        print(f"Tau        : {0.25 * args.novelty_delta**2}")
+    print("Threshold  : quantile")
+    print(f"Quantile   : {args.novelty_quantile}")
     print(f"Use RFF    : {args.use_rff}")
     if args.use_rff:
         print(f"RFF dims   : {args.rff_components}")
@@ -751,7 +706,6 @@ def run_fixed_experiment(args, datasets, seeds, run_all):
                         args.reference_size,
                         args.neighbors,
                         args.novelty_quantile,
-                        args.novelty_delta,
                         args.rff_components,
                         args.rff_gamma_multiplier,
                     )
@@ -826,15 +780,11 @@ def validate_grid_arguments(args):
         raise ValueError("Grid reference sizes must be in (0, 0.30].")
     if any(value < 1 for value in args.grid_neighbors):
         raise ValueError("Grid neighbors must be at least one.")
-    if args.threshold_mode == "quantile" and any(
+    if any(
         value <= 0.0 or value >= 1.0
         for value in args.grid_novelty_quantiles
     ):
         raise ValueError("Grid novelty quantiles must be between zero and one.")
-    if args.threshold_mode == "delta" and any(
-        value <= 0.0 for value in args.grid_deltas
-    ):
-        raise ValueError("Grid deltas must be greater than zero.")
     if args.use_rff and any(
         value < 1 for value in args.grid_rff_components
     ):
@@ -929,121 +879,6 @@ def configuration_id(
     return f"cfg_{digest}"
 
 
-def config_from_parameters(parameters):
-    threshold_mode = parameters.get("threshold_mode", "quantile")
-    return (
-        parameters["scaler"],
-        float(parameters["reference_size"]),
-        int(parameters["neighbors"]),
-        threshold_mode,
-        (
-            float(parameters["novelty_quantile"])
-            if parameters.get("novelty_quantile") is not None
-            else None
-        ),
-        (
-            float(parameters["novelty_delta"])
-            if parameters.get("novelty_delta") is not None
-            else None
-        ),
-        (
-            int(parameters["rff_components"])
-            if parameters.get("use_rff")
-            else None
-        ),
-        (
-            float(parameters["rff_gamma_multiplier"])
-            if parameters.get("use_rff")
-            else None
-        ),
-    )
-
-
-def file_digest(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def copy_without_overwrite(source, destination):
-    if destination.exists():
-        if file_digest(source) != file_digest(destination):
-            raise FileExistsError(
-                f"Refusing to overwrite different file: {destination}"
-            )
-        return False
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
-    if file_digest(source) != file_digest(destination):
-        destination.unlink(missing_ok=True)
-        raise OSError(f"Verification failed while copying {source}")
-    return True
-
-
-def migrate_legacy_grid_results(legacy_dir, output_dir, validation_size):
-    """Copy legacy long-name configs into short, collision-safe directories."""
-    legacy_dir = legacy_dir.resolve()
-    output_dir = output_dir.resolve()
-    if not legacy_dir.exists() or legacy_dir == output_dir:
-        return {"configurations": 0, "files_copied": 0}
-
-    configurations = 0
-    files_copied = 0
-    for parameter_path in legacy_dir.glob("*/*/parameters.json"):
-        parameters = json.loads(parameter_path.read_text(encoding="utf-8"))
-        config = config_from_parameters(parameters)
-        resolved_novel_class = parameters.get("resolved_novel_class")
-        effective_validation_size = float(
-            parameters.get("validation_size", validation_size)
-        )
-        short_name = configuration_id(
-            config,
-            bool(parameters.get("use_rff")),
-            float(parameters["epsilon"]),
-            resolved_novel_class,
-            effective_validation_size,
-        )
-        destination = output_dir / parameters["dataset"] / short_name
-        destination.mkdir(parents=True, exist_ok=True)
-
-        augmented = dict(parameters)
-        augmented["configuration_id"] = short_name
-        augmented["configuration_name"] = parameter_path.parent.name
-        augmented["validation_size"] = effective_validation_size
-        destination_parameters = destination / "parameters.json"
-        if destination_parameters.exists():
-            existing = json.loads(
-                destination_parameters.read_text(encoding="utf-8")
-            )
-            if existing.get("configuration_id") != short_name:
-                raise FileExistsError(
-                    f"Configuration collision: {destination_parameters}"
-                )
-        else:
-            save_json(destination_parameters, augmented)
-            files_copied += 1
-
-        for source_file in parameter_path.parent.iterdir():
-            if source_file.is_file() and source_file.name != "parameters.json":
-                if copy_without_overwrite(
-                    source_file,
-                    destination / source_file.name,
-                ):
-                    files_copied += 1
-        configurations += 1
-
-    summary = {
-        "source": str(legacy_dir),
-        "destination": str(output_dir),
-        "configurations": configurations,
-        "files_copied": files_copied,
-    }
-    save_json(output_dir / "legacy_import.json", summary)
-    return summary
-
-
 def grid_configurations(args):
     rff_settings = (
         list(
@@ -1055,11 +890,10 @@ def grid_configurations(args):
         if args.use_rff
         else [(None, None)]
     )
-    threshold_settings = (
-        [("quantile", value, None) for value in args.grid_novelty_quantiles]
-        if args.threshold_mode == "quantile"
-        else [("delta", None, value) for value in args.grid_deltas]
-    )
+    threshold_settings = [
+        ("quantile", value, None)
+        for value in args.grid_novelty_quantiles
+    ]
     return [
         (
             scaler,
@@ -1360,7 +1194,6 @@ def save_configuration_result(
                     reference_size,
                     neighbors,
                     quantile,
-                    delta,
                     components,
                     gamma,
                 )
@@ -1445,10 +1278,7 @@ def save_configuration_result(
         f"dataset={dataset} config={short_name} scaler={scaler} "
         f"ref={reference_size:g} k={neighbors}"
     )
-    if threshold_mode == "quantile":
-        message += f" quantile={quantile:g}"
-    else:
-        message += f" delta={delta:g} tau={0.25 * delta**2:g}"
+    message += f" quantile={quantile:g}"
     if args.use_rff:
         message += f" rff={components} gamma_mult={gamma:g}"
     if candidate is not None:
@@ -1474,11 +1304,7 @@ def select_best_parameters(args, datasets, candidates, version):
                 "mcc_with_novel",
                 "reference_size",
                 "neighbors",
-                (
-                    "novelty_quantile"
-                    if args.threshold_mode == "quantile"
-                    else "novelty_delta"
-                ),
+                "novelty_quantile",
                 "rff_components" if args.use_rff else None,
             ]
         )
@@ -1557,15 +1383,9 @@ def run_grid_search(args, datasets, seeds, run_all):
         "scalers": args.grid_scalers,
         "reference_sizes": args.grid_reference_sizes,
         "neighbors": args.grid_neighbors,
-        "threshold_mode": args.threshold_mode,
-        "novelty_quantiles": (
-            args.grid_novelty_quantiles
-            if args.threshold_mode == "quantile"
-            else None
-        ),
-        "novelty_deltas": (
-            args.grid_deltas if args.threshold_mode == "delta" else None
-        ),
+        "threshold_mode": "quantile",
+        "novelty_quantiles": args.grid_novelty_quantiles,
+        "novelty_deltas": None,
         "epsilon": args.epsilon,
         "use_rff": args.use_rff,
         "rff_components": args.grid_rff_components if args.use_rff else None,
@@ -1596,11 +1416,8 @@ def run_grid_search(args, datasets, seeds, run_all):
     print(f"Scalers    : {args.grid_scalers}")
     print(f"Ref sizes  : {args.grid_reference_sizes}")
     print(f"Neighbors  : {args.grid_neighbors}")
-    print(f"Threshold  : {args.threshold_mode}")
-    if args.threshold_mode == "quantile":
-        print(f"Quantiles  : {args.grid_novelty_quantiles}")
-    else:
-        print(f"Deltas     : {args.grid_deltas}")
+    print("Threshold  : quantile")
+    print(f"Quantiles  : {args.grid_novelty_quantiles}")
     print(f"Use RFF    : {args.use_rff}")
     if args.use_rff:
         print(f"RFF dims   : {args.grid_rff_components}")
@@ -1609,29 +1426,6 @@ def run_grid_search(args, datasets, seeds, run_all):
     print(f"Metric     : {args.selection_metric}")
     print(f"Resume     : {not args.force}")
     print(f"Output     : {output_dir.resolve()}")
-
-    if args.output_dir is None and not args.force:
-        legacy_dir = (
-            WORKSPACE_ROOT
-            / "results"
-            / "lim-models-multiclass-novelty"
-            / version
-            / grid_mode
-        )
-        import_marker = output_dir / "legacy_import.json"
-        if import_marker.exists():
-            print(f"Legacy import already complete: {import_marker}")
-        else:
-            migration = migrate_legacy_grid_results(
-                legacy_dir,
-                output_dir,
-                args.validation_size,
-            )
-            print(
-                "Imported legacy results: "
-                f"{migration['configurations']} configurations, "
-                f"{migration['files_copied']} new files"
-            )
 
     candidates = []
     report_rows = []

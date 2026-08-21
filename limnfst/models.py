@@ -6,7 +6,7 @@ from sklearn.model_selection import train_test_split
 
 from .mapping import center_and_normalize, center_projection
 from .nfst import train_lim_projection
-from .novelty import get_threshold
+from .novelty import reference_cloud_threshold
 
 
 class LIM_NFST:
@@ -16,8 +16,6 @@ class LIM_NFST:
         reference_size=0.20,
         number_of_neighbors=5,
         novelty_quantile=0.95,
-        threshold_mode="quantile",
-        novelty_delta=2.0,
         random_state=42,
         use_rff=False,
         rff_components=256,
@@ -27,21 +25,19 @@ class LIM_NFST:
         self.reference_size = float(reference_size)
         self.number_of_neighbors = int(number_of_neighbors)
         self.novelty_quantile = float(novelty_quantile)
-        self.threshold_mode = str(threshold_mode)
-        self.novelty_delta = float(novelty_delta)
         self.random_state = int(random_state)
         self.use_rff = bool(use_rff)
         self.rff_components = int(rff_components)
         self.rff_gamma_multiplier = float(rff_gamma_multiplier)
 
-        if self.threshold_mode not in {"quantile", "delta"}:
-            raise ValueError("threshold_mode must be 'quantile' or 'delta'.")
-        if self.threshold_mode == "quantile" and not (
-            0.0 < self.novelty_quantile < 1.0
-        ):
+        if not 0.0 < self.novelty_quantile < 1.0:
             raise ValueError("novelty_quantile must be between zero and one.")
-        if self.threshold_mode == "delta" and self.novelty_delta <= 0.0:
-            raise ValueError("novelty_delta must be greater than zero.")
+        if self.epsilon <= 0.0:
+            raise ValueError("epsilon must be greater than zero.")
+        if not 0.0 < self.reference_size < 1.0:
+            raise ValueError("reference_size must be between zero and one.")
+        if self.number_of_neighbors < 1:
+            raise ValueError("number_of_neighbors must be at least one.")
 
         # This remains None until fit() finishes learning the projection.
         self.projection_matrix_ = None
@@ -88,33 +84,21 @@ class LIM_NFST:
             raise RuntimeError("Call fit before applying RFF.")
         return self.rff_mapper_.transform(X)
 
-    # def _check_parameters(self):
-    #     if self.epsilon <= 0.0:
-    #         raise ValueError("epsilon must be greater than zero.")
-    #     if not 0.0 < self.reference_size < 1.0:
-    #         raise ValueError("reference_size must be between zero and one.")
-    #     if self.number_of_neighbors < 1:
-    #         raise ValueError("number_of_neighbors must be at least one.")
-    #     if not 0.0 < self.novelty_quantile < 1.0:
-    #         raise ValueError("novelty_quantile must be between zero and one.")
-
     def fit(self, X, y):
         """Learn the LIM projection and build one reference cloud per class."""
-        # self._check_parameters()
-
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y)
+
+        if X.ndim != 2:
+            raise ValueError("X must be a two-dimensional matrix.")
+        if len(X) != len(y):
+            raise ValueError("X and y must contain the same number of samples.")
+        if not np.isfinite(X).all():
+            raise ValueError("X contains NaN or infinite values.")
 
         self.n_features_in_ = X.shape[1]
         X = self._fit_rff(X)
         self.model_features_in_ = X.shape[1]
-
-        # if X.ndim != 2:
-        #     raise ValueError("X must be a two-dimensional matrix.")
-        # if len(X) != len(y):
-        #     raise ValueError("X and y must contain the same number of samples.")
-        # if not np.isfinite(X).all():
-        #     raise ValueError("X contains NaN or infinite values.")
 
         # X_fit is used to learn Theta. X_reference is never used to learn it.
         X_fit, X_reference, y_fit, y_reference = train_test_split(
@@ -126,7 +110,7 @@ class LIM_NFST:
         )
 
         X_fit_normalized = center_and_normalize(X_fit)
-        classes, theta, projection_matrix, base_points = train_lim_projection(
+        classes, theta, projection_matrix = train_lim_projection(
             X_fit_normalized,
             y_fit,
             self.epsilon,
@@ -135,7 +119,6 @@ class LIM_NFST:
         self.classes_ = classes
         self.theta_ = theta
         self.projection_matrix_ = projection_matrix
-        self.base_points_ = base_points
         self.X_fit_ = X_fit
         self.y_fit_ = y_fit
         self.X_reference_ = X_reference
@@ -154,11 +137,10 @@ class LIM_NFST:
                 y_reference == class_label
             ]
 
-            # At least two points are required for leave-one-out calibration.
-            # if len(class_reference_points) < 2:
-            #     raise ValueError(
-            #         f"Class {class_label!r} needs at least two reference samples."
-            #     )
+            if len(class_reference_points) < 2:
+                raise ValueError(
+                    f"Class {class_label!r} needs at least two reference samples."
+                )
 
             threshold = self._calculate_reference_threshold(
                 class_reference_points
@@ -224,20 +206,16 @@ class LIM_NFST:
         return nearest_distances.mean(axis=1)
 
     def _calculate_reference_threshold(self, class_reference_points):
-        """Calculate either an adaptive quantile or global delta threshold."""
-        if self.threshold_mode == "delta":
-            return get_threshold(self.novelty_delta)
-
+        """Calibrate one class radius from leave-one-out cloud distances."""
         leave_one_out_scores = self._mean_nearest_distance(
             class_reference_points,
             class_reference_points,
             exclude_same_sample=True,
         )
-        threshold = np.quantile(
+        return reference_cloud_threshold(
             leave_one_out_scores,
             self.novelty_quantile,
         )
-        return max(float(threshold), 1e-12)
 
     def reference_scores(self, X):
         """Return one reference distance per sample and class."""

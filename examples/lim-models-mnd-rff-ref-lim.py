@@ -1,8 +1,8 @@
 """Run one fixed RFF-REF-LIM configuration for MND/LOCO.
 
-There is deliberately no grid search: each invocation evaluates one
-configuration. The threshold modes are paper (tau = (delta / 2)^2) and
-quantile (leave-one-out calibration per known class).
+Task 1 and Task 2 use the same reference-cloud distance.  Task 2 marks a
+sample as novel when the distance to its predicted class exceeds that class's
+leave-one-out quantile radius.
 """
 
 from __future__ import annotations
@@ -16,9 +16,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
-
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
@@ -30,16 +27,15 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+
 CLASSIFIER_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CLASSIFIER_ROOT))
 
 from limnfst.datasets import DATASETS, DEFAULT_LIMITS, load_dataset
 from limnfst.models import LIM_NFST
-from limnfst.preprocessing import (
-    SCALERS,
-    make_scaler,
-    remove_training_outliers,
-)
+from limnfst.preprocessing import SCALERS, make_scaler, remove_training_outliers
+
 
 TEST_SIZE = 0.20
 NOVEL_LABEL = -1
@@ -68,6 +64,7 @@ def get_version() -> str:
         CLASSIFIER_ROOT / "limnfst" / "models.py",
         CLASSIFIER_ROOT / "limnfst" / "nfst.py",
         CLASSIFIER_ROOT / "limnfst" / "novelty.py",
+        CLASSIFIER_ROOT / "limnfst" / "mapping.py",
         CLASSIFIER_ROOT / "limnfst" / "datasets.py",
         CLASSIFIER_ROOT / "limnfst" / "preprocessing.py",
     ]
@@ -94,7 +91,7 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=None,
-        help="Row limit; defaults to the dataset's standard limit.",
+        help="Prepared dataset variant; defaults to the standard variant.",
     )
     parser.add_argument(
         "--novel-class",
@@ -113,21 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=1e-4)
     parser.add_argument("--rff-components", type=int, default=256)
     parser.add_argument("--rff-gamma-multiplier", type=float, default=1.0)
-    parser.add_argument(
-        "--threshold-mode",
-        choices=["paper", "quantile"],
-        default="paper",
-        help="paper: tau=(delta/2)^2; quantile: adaptive class threshold.",
-    )
     parser.add_argument("--novelty-quantile", type=float, default=0.95)
-    parser.add_argument(
-        "--delta",
-        "--paper-delta",
-        dest="paper_delta",
-        type=float,
-        default=2.0,
-        help="Paper parameter delta, where tau=(delta/2)^2.",
-    )
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
 
@@ -145,24 +128,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rff-components must be at least one.")
     if args.rff_gamma_multiplier <= 0.0:
         raise ValueError("--rff-gamma-multiplier must be greater than zero.")
-    if args.threshold_mode == "quantile" and not (
-        0.0 < args.novelty_quantile < 1.0
-    ):
+    if not 0.0 < args.novelty_quantile < 1.0:
         raise ValueError("--novelty-quantile must be between zero and one.")
-    if args.threshold_mode == "paper" and args.paper_delta <= 0.0:
-        raise ValueError("--delta must be greater than zero.")
 
 
-def resolve_novel_class(y_raw: np.ndarray, requested_class: object):
-    """Resolve an exact raw label first, then a zero-based class index."""
+def resolve_novel_class(y_raw: np.ndarray, requested_class: object) -> object:
     classes = np.unique(y_raw)
     if len(classes) < 2:
         raise ValueError("MND requires at least two classes.")
     if requested_class is None:
         return classes[0]
-    matches = [label for label in classes if str(label) == str(requested_class)]
-    if matches:
-        return matches[0]
+
+    matching_labels = [label for label in classes if str(label) == str(requested_class)]
+    if matching_labels:
+        return matching_labels[0]
+
     try:
         class_index = int(requested_class)
     except (TypeError, ValueError) as error:
@@ -181,13 +161,12 @@ def resolve_novel_classes(
     dataframe: pd.DataFrame,
     requested_class: object,
 ) -> list[object]:
-    y_raw = dataframe.iloc[:, -1].to_numpy()
+    labels = dataframe.iloc[:, -1].to_numpy()
     if requested_class is not None:
-        return [resolve_novel_class(y_raw, requested_class)]
-    classes = np.unique(y_raw)
-    if len(classes) < 2:
+        return [resolve_novel_class(labels, requested_class)]
+    if len(np.unique(labels)) < 2:
         raise ValueError("MND requires at least two classes.")
-    return classes.tolist()
+    return np.unique(labels).tolist()
 
 
 def prepare_mnd_data(
@@ -233,24 +212,19 @@ def prepare_mnd_data(
     X_novel = np.nan_to_num(X_novel, nan=0.0)
     order = y_train_raw.argsort()
     X_train, y_train_raw = X_train[order], y_train_raw[order]
-    label_encoder = LabelEncoder()
-    y_train = label_encoder.fit_transform(y_train_raw)
+    encoder = LabelEncoder()
+    y_train = encoder.fit_transform(y_train_raw)
     X_train, y_train = remove_training_outliers(X_train, y_train)
-    y_known_test = label_encoder.transform(y_known_test_raw)
+    y_known_test = encoder.transform(y_known_test_raw)
     return X_train, y_train, X_known_test, y_known_test, X_novel, novel_class
 
 
 def make_model(args: argparse.Namespace) -> LIM_NFST:
-    model_threshold_mode = (
-        "quantile" if args.threshold_mode == "quantile" else "delta"
-    )
     return LIM_NFST(
         epsilon=args.epsilon,
         reference_size=args.reference_size,
         number_of_neighbors=args.neighbors,
         novelty_quantile=args.novelty_quantile,
-        threshold_mode=model_threshold_mode,
-        novelty_delta=args.paper_delta,
         random_state=args.seed,
         use_rff=True,
         rff_components=args.rff_components,
@@ -267,16 +241,12 @@ def calculate_metrics(
     y_pred_open = np.asarray(y_pred_open, dtype=int)
     y_pred_closed = np.asarray(y_pred_closed, dtype=int)
     known_mask = y_true != NOVEL_LABEL
-    if known_mask.any():
-        closed_accuracy = accuracy_score(
-            y_true[known_mask], y_pred_closed[known_mask]
-        )
-        closed_balanced_accuracy = balanced_accuracy_score(
-            y_true[known_mask], y_pred_closed[known_mask]
-        )
-    else:
-        closed_accuracy = 0.0
-        closed_balanced_accuracy = 0.0
+    closed_accuracy = accuracy_score(
+        y_true[known_mask], y_pred_closed[known_mask]
+    ) if known_mask.any() else 0.0
+    closed_balanced_accuracy = balanced_accuracy_score(
+        y_true[known_mask], y_pred_closed[known_mask]
+    ) if known_mask.any() else 0.0
 
     is_novel_true = (y_true == NOVEL_LABEL).astype(int)
     is_novel_pred = (y_pred_open == NOVEL_LABEL).astype(int)
@@ -330,23 +300,23 @@ def evaluate_model(
     evaluation_sets = [
         ("known", X_known, y_known),
         ("novel", X_novel, y_novel),
-        (
-            "combined",
-            np.vstack([X_known, X_novel]),
-            np.concatenate([y_known, y_novel]),
-        ),
+        ("combined", np.vstack([X_known, X_novel]), np.concatenate([y_known, y_novel])),
     ]
     rows = []
     for test_set, X_test, y_true in evaluation_sets:
-        y_open = model.predict_open(X_test, novel_label=NOVEL_LABEL)
-        y_closed = model.predict_closed(X_test)
         row = {
             "dataset": dataset,
             "model": MODEL_NAME,
             "novel_class": str(novel_class),
             "test_set": test_set,
         }
-        row.update(calculate_metrics(y_true, y_open, y_closed))
+        row.update(
+            calculate_metrics(
+                y_true,
+                model.predict_open(X_test, novel_label=NOVEL_LABEL),
+                model.predict_closed(X_test),
+            )
+        )
         rows.append(row)
     return rows
 
@@ -364,14 +334,13 @@ def output_dir(args: argparse.Namespace, version: str) -> Path:
         "epsilon": args.epsilon,
         "rff_components": args.rff_components,
         "rff_gamma_multiplier": args.rff_gamma_multiplier,
-        "threshold_mode": args.threshold_mode,
-        "novelty_quantile": (
-            args.novelty_quantile if args.threshold_mode == "quantile" else None
-        ),
-        "paper_delta": args.paper_delta if args.threshold_mode == "paper" else None,
+        "threshold_mode": "quantile",
+        "novelty_quantile": args.novelty_quantile,
+        "paper_delta": None,
     }
-    serialized = json.dumps(configuration, sort_keys=True, separators=(",", ":"))
-    configuration_id = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:12]
+    configuration_id = hashlib.sha256(
+        json.dumps(configuration, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
     return (
         CLASSIFIER_ROOT
         / "results"
@@ -383,7 +352,6 @@ def output_dir(args: argparse.Namespace, version: str) -> Path:
 
 
 def parameters_payload(args: argparse.Namespace, version: str) -> dict[str, object]:
-    paper_threshold = 0.25 * args.paper_delta**2
     return {
         "mode": "fixed RFF-REF-LIM MND evaluation",
         "model_display_name": MODEL_NAME,
@@ -401,14 +369,10 @@ def parameters_payload(args: argparse.Namespace, version: str) -> dict[str, obje
         "rff_components": args.rff_components,
         "rff_gamma": "scale_times_multiplier",
         "rff_gamma_multiplier": args.rff_gamma_multiplier,
-        "threshold_mode": args.threshold_mode,
-        "novelty_quantile": (
-            args.novelty_quantile if args.threshold_mode == "quantile" else None
-        ),
-        "paper_delta": args.paper_delta if args.threshold_mode == "paper" else None,
-        "paper_threshold_tau": (
-            paper_threshold if args.threshold_mode == "paper" else None
-        ),
+        "threshold_mode": "quantile",
+        "novelty_quantile": args.novelty_quantile,
+        "paper_delta": None,
+        "paper_threshold_tau": None,
     }
 
 
@@ -427,40 +391,19 @@ def main() -> int:
         results_dir / "novel_classes.json",
         {args.dataset: [str(novel_class) for novel_class in novel_classes]},
     )
-    print("Mode       : fixed RFF-REF-LIM MND evaluation")
-    print(f"Dataset    : {args.dataset} (limit={row_limit})")
-    print(f"Seed       : {args.seed}")
-    print(f"Novel class: {args.novel_class or 'all classes (full LOCO)'}")
-    print(f"Scaler     : {args.scaler}")
-    print(f"Reference  : {args.reference_size}")
-    print(f"Neighbors  : {args.neighbors}")
-    print(f"RFF dims   : {args.rff_components}")
-    print(f"Gamma mult : {args.rff_gamma_multiplier}")
-    if args.threshold_mode == "quantile":
-        print(f"Threshold  : quantile={args.novelty_quantile}")
-    else:
-        threshold = 0.25 * args.paper_delta**2
-        print(
-            "Threshold  : paper "
-            f"delta={args.paper_delta}, tau=(delta/2)^2={threshold}"
-        )
-    print(f"Output     : {results_dir.resolve()}")
 
-    run_rows: list[dict[str, object]] = []
-    errors: list[dict[str, str]] = []
-    rff_gamma_by_novel_class: dict[str, float] = {}
+    run_rows = []
+    rff_gamma_by_novel_class = {}
     for novel_class in novel_classes:
-        try:
-            prepared = prepare_mnd_data(
-                dataframe,
-                novel_class,
-                args.scaler,
-                args.seed,
-            )
-            X_train, y_train, X_known, y_known, X_novel, resolved_class = prepared
-            model = make_model(args)
-            model.fit(X_train, y_train)
-            class_rows = evaluate_model(
+        X_train, y_train, X_known, y_known, X_novel, resolved_class = prepare_mnd_data(
+            dataframe,
+            novel_class,
+            args.scaler,
+            args.seed,
+        )
+        model = make_model(args).fit(X_train, y_train)
+        run_rows.extend(
+            evaluate_model(
                 model,
                 args.dataset,
                 resolved_class,
@@ -468,37 +411,17 @@ def main() -> int:
                 y_known,
                 X_novel,
             )
-            run_rows.extend(class_rows)
-            rff_gamma_by_novel_class[str(resolved_class)] = float(model.rff_gamma_)
-            combined = next(
-                row for row in class_rows if row["test_set"] == "combined"
-            )
-            print(
-                f"novel_class={resolved_class} "
-                f"accuracy={combined['accuracy_with_novel']:.4f} "
-                f"novel_f1={combined['novel_detection_f1']:.4f}"
-            )
-        except Exception as error:
-            errors.append(
-                {
-                    "dataset": args.dataset,
-                    "novel_class": str(novel_class),
-                    "error": f"{type(error).__name__}: {error}",
-                }
-            )
-            print(f"FAILED novel_class={novel_class}: {error}")
+        )
+        rff_gamma_by_novel_class[str(resolved_class)] = float(model.rff_gamma_)
 
     class_results = pd.DataFrame(run_rows, columns=RUN_COLUMNS)
-    if class_results.empty:
-        results = pd.DataFrame(columns=SUMMARY_COLUMNS)
-    else:
-        results = (
-            class_results.groupby(
-                ["dataset", "model", "test_set"], as_index=False
-            )[METRIC_COLUMNS]
-            .mean()
-            .reindex(columns=SUMMARY_COLUMNS)
-        )
+    results = (
+        class_results.groupby(["dataset", "model", "test_set"], as_index=False)[
+            METRIC_COLUMNS
+        ]
+        .mean()
+        .reindex(columns=SUMMARY_COLUMNS)
+    )
     results.to_csv(results_dir / "results.csv", index=False, float_format="%.8f")
     class_results.to_csv(
         results_dir / "results_by_novel_class.csv",
@@ -506,12 +429,10 @@ def main() -> int:
         float_format="%.8f",
     )
     save_json(results_dir / "rff_gamma_by_novel_class.json", rff_gamma_by_novel_class)
-    if errors:
-        save_json(results_dir / "errors.json", errors)
 
-    print("\nFinal mean results across held-out classes:")
     print(results.to_string(index=False))
-    return 0 if not errors else 2
+    print(f"Output: {results_dir.resolve()}")
+    return 0
 
 
 if __name__ == "__main__":

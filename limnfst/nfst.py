@@ -77,7 +77,7 @@ def calculate_initial_projection(Q_basis, R, y, classes):
 
 
 def align_projection_to_simplex(theta_initial, initial_centroids):
-    """Align Theta_init to H_c = I_c - 11.T/c using A = M.T(MM.T)^-1."""
+    """Align Theta_init to H_c = I_c - 11.T/c."""
     centroid_gram = initial_centroids @ initial_centroids.T
     
     alignment = np.linalg.solve(
@@ -86,8 +86,7 @@ def align_projection_to_simplex(theta_initial, initial_centroids):
     ).T
 
     theta = theta_initial @ alignment.T
-    base_points = (alignment @ initial_centroids).T
-    return theta, base_points
+    return theta
 
 
 def train_lim_projection(X_normalized, y, epsilon):
@@ -107,10 +106,10 @@ def train_lim_projection(X_normalized, y, epsilon):
         y,
         classes,
     )
-    theta, base_points = align_projection_to_simplex(
+    theta = align_projection_to_simplex(
         theta_initial,
         initial_centroids,
     )
 
     projection_matrix = X_normalized.T @ theta
-    return classes, theta, projection_matrix, base_points
+    return classes, theta, projection_matrix

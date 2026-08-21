@@ -85,11 +85,8 @@ def preprocess_data(
     X = data[:, :-1].astype(np.float64)
     raw_y = data[:, -1]
 
-    imputer = None
     if dataset_name == "IoTID20":
         X[np.isinf(X)] = np.nan
-        imputer = SimpleImputer(strategy="mean")
-        X = imputer.fit_transform(X)
 
     X_train, X_test, raw_y_train, raw_y_test = train_test_split(
         X,
@@ -98,6 +95,12 @@ def preprocess_data(
         stratify=raw_y,
         random_state=random_state,
     )
+
+    imputer = None
+    if dataset_name == "IoTID20":
+        imputer = SimpleImputer(strategy="mean")
+        X_train = imputer.fit_transform(X_train)
+        X_test = imputer.transform(X_test)
 
     order = raw_y_train.argsort()
     X_train = X_train[order]
