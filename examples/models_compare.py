@@ -25,7 +25,6 @@ from sklearn.neighbors import (
     NearestCentroid,
     RadiusNeighborsClassifier,
 )
-from sklearn.model_selection import ParameterGrid, StratifiedKFold
 from sklearn.svm import NuSVC
 
 
@@ -82,49 +81,9 @@ MODEL_NAMES = [
     "NuSVC",
     "SGD",
 ]
-COMPETITOR_MODEL_NAMES = [
-    "kNFST",
-    "LDA",
-    "GaussianNB",
-    "KNeighbors",
-    "NearestCentroid",
-    "RadiusNeighbors",
-    "NuSVC",
-    "SGD",
-]
-COMPETITOR_SELECTION_METRICS = [
-    "macro_f1",
-    "weighted_f1",
-    "micro_f1",
-    "balanced_accuracy",
-    "accuracy",
-    "mcc",
-    "cohen_kappa",
-]
 
 METRIC_COLUMNS = list(SUMMARY_METRIC_COLUMNS)
 RESULT_COLUMNS = ["dataset", "model", *METRIC_COLUMNS]
-COMPETITOR_GRID_RESULT_COLUMNS = [
-    "dataset",
-    "seed",
-    "model",
-    "candidate_index",
-    "parameters_json",
-    "selection_metric",
-    "validation_score",
-    "validation_score_std",
-    "cv_folds",
-]
-COMPETITOR_BEST_PARAMETER_COLUMNS = [
-    "dataset",
-    "seed",
-    "model",
-    "parameters_json",
-    "selection_metric",
-    "validation_score",
-    "validation_score_std",
-    "cv_folds",
-]
 
 
 def get_lim_version():
@@ -220,7 +179,7 @@ def parse_args():
     parser.add_argument(
         "--best-parameter-source",
         choices=["lim_ref", "rff_ref"],
-        default="rff_ref",
+        default="lim_ref",
         help=(
             "lim_ref: use the no-RFF grid from lim-models.py; "
             "rff_ref: use the RFF grid from lim-models.py."
@@ -229,26 +188,6 @@ def parse_args():
     parser.add_argument("--best-parameters-file", type=Path, default=None)
     parser.add_argument("--rff-components", type=int, default=256)
     parser.add_argument("--rff-gamma-multiplier", type=float, default=1.0)
-    parser.add_argument("--competitor-cv-folds", type=int, default=5)
-    parser.add_argument(
-        "--competitor-selection-metric",
-        choices=COMPETITOR_SELECTION_METRICS,
-        default="macro_f1",
-    )
-    competitor_grid_group = parser.add_mutually_exclusive_group()
-    competitor_grid_group.add_argument(
-        "--competitor-grid",
-        action="store_true",
-        dest="competitor_grid",
-        help="Tune each non-LIM competitor on outer-training CV (default).",
-    )
-    competitor_grid_group.add_argument(
-        "--no-competitor-grid",
-        action="store_false",
-        dest="competitor_grid",
-        help="Use each competitor's fixed default parameters.",
-    )
-    parser.set_defaults(competitor_grid=True)
     parser.add_argument(
         "--single-sample-repeats",
         type=int,
@@ -367,8 +306,8 @@ def create_model(
     epsilon,
     rff_components,
     rff_gamma_multiplier,
-    competitor_parameters=None,
 ):
+    """Create one model. Kept explicit so each configuration is visible."""
     if model_name == "LIM_NFST":
         return LIM_NFST(
             epsilon=epsilon,
@@ -386,248 +325,31 @@ def create_model(
             rff_components=rff_components,
             rff_gamma_multiplier=rff_gamma_multiplier,
         )
-    return create_competitor_model(
-        model_name,
-        seed,
-        competitor_parameters,
-    )
-
-
-def create_competitor_model(model_name, seed, parameters=None):
-    parameters = {} if parameters is None else dict(parameters)
     if model_name == "kNFST":
-        model_parameters = {"kernel": "rbf"}
-        model_parameters.update(parameters)
-        return KNFST(**model_parameters)
+        return KNFST(kernel="rbf")
     if model_name == "LDA":
-        model_parameters = {"solver": "svd"}
-        model_parameters.update(parameters)
-        return LinearDiscriminantAnalysis(**model_parameters)
+        return LinearDiscriminantAnalysis(solver="svd")
     if model_name == "GaussianNB":
-        return GaussianNB(**parameters)
+        return GaussianNB()
     if model_name == "KNeighbors":
-        model_parameters = {"n_neighbors": 5}
-        model_parameters.update(parameters)
-        return KNeighborsClassifier(**model_parameters)
+        return KNeighborsClassifier(n_neighbors=5)
     if model_name == "NearestCentroid":
-        model_parameters = {"metric": "euclidean"}
-        model_parameters.update(parameters)
-        return NearestCentroid(**model_parameters)
+        return NearestCentroid(metric="euclidean")
     if model_name == "RadiusNeighbors":
-        model_parameters = {
-            "radius": 1.0,
-            "outlier_label": "most_frequent",
-        }
-        model_parameters.update(parameters)
-        return RadiusNeighborsClassifier(**model_parameters)
-    if model_name == "NuSVC":
-        model_parameters = {"nu": 0.2, "kernel": "rbf"}
-        model_parameters.update(parameters)
-        return NuSVC(random_state=seed, **model_parameters)
-    if model_name == "SGD":
-        model_parameters = {
-            "loss": "log_loss",
-            "max_iter": 1000,
-            "tol": 1e-3,
-        }
-        model_parameters.update(parameters)
-        return SGDClassifier(random_state=seed, **model_parameters)
-    raise ValueError(f"Unknown model: {model_name}")
-
-
-def run_competitor_grid(
-    model_name,
-    parameter_grid,
-    X_train,
-    y_train,
-    seed,
-    cv_folds,
-    selection_metric,
-):
-    labels = np.unique(y_train)
-    splitter = StratifiedKFold(
-        n_splits=cv_folds,
-        shuffle=True,
-        random_state=seed,
-    )
-    rows = []
-    for candidate_index, parameters in enumerate(ParameterGrid(parameter_grid)):
-        fold_scores = []
-        for fit_indices, validation_indices in splitter.split(X_train, y_train):
-            model = create_competitor_model(model_name, seed, parameters)
-            model.fit(X_train[fit_indices], y_train[fit_indices])
-            predict = make_predict_function(
-                model,
-                model_name,
-                labels,
-            )
-            y_pred = np.asarray(predict(X_train[validation_indices]))
-            summary = calculate_summary_metrics(
-                y_train[validation_indices],
-                y_pred,
-                labels=labels,
-            )
-            fold_scores.append(summary[selection_metric])
-        rows.append(
-            {
-                "model": model_name,
-                "candidate_index": candidate_index,
-                "parameters_json": json.dumps(parameters, sort_keys=True),
-                "selection_metric": selection_metric,
-                "validation_score": float(np.mean(fold_scores)),
-                "validation_score_std": float(np.std(fold_scores)),
-                "cv_folds": cv_folds,
-            }
+        return RadiusNeighborsClassifier(
+            radius=1.0,
+            outlier_label="most_frequent",
         )
-    best = sorted(
-        rows,
-        key=lambda row: (
-            -row["validation_score"],
-            row["validation_score_std"],
-            row["parameters_json"],
-        ),
-    )[0]
-    return json.loads(best["parameters_json"]), best, rows
-
-
-def tune_knfst(X_train, y_train, seed, args):
-    parameter_grid = {"kernel": ["linear", "rbf", "poly"]}
-    return run_competitor_grid(
-        "kNFST",
-        parameter_grid,
-        X_train,
-        y_train,
-        seed,
-        args.competitor_cv_folds,
-        args.competitor_selection_metric,
-    )
-
-
-def tune_lda(X_train, y_train, seed, args):
-    parameter_grid = [
-        {"solver": ["svd"]},
-        {"solver": ["lsqr"], "shrinkage": ["auto"]},
-    ]
-    return run_competitor_grid(
-        "LDA",
-        parameter_grid,
-        X_train,
-        y_train,
-        seed,
-        args.competitor_cv_folds,
-        args.competitor_selection_metric,
-    )
-
-
-def tune_gaussian_nb(X_train, y_train, seed, args):
-    parameter_grid = {"var_smoothing": [1e-11, 1e-9, 1e-7, 1e-5]}
-    return run_competitor_grid(
-        "GaussianNB",
-        parameter_grid,
-        X_train,
-        y_train,
-        seed,
-        args.competitor_cv_folds,
-        args.competitor_selection_metric,
-    )
-
-
-def tune_kneighbors(X_train, y_train, seed, args):
-    parameter_grid = {
-        "n_neighbors": [3, 5, 9],
-        "weights": ["uniform", "distance"],
-        "p": [1, 2],
-    }
-    return run_competitor_grid(
-        "KNeighbors",
-        parameter_grid,
-        X_train,
-        y_train,
-        seed,
-        args.competitor_cv_folds,
-        args.competitor_selection_metric,
-    )
-
-
-def tune_nearest_centroid(X_train, y_train, seed, args):
-    parameter_grid = [
-        {
-            "metric": ["euclidean"],
-            "shrink_threshold": [None, 0.1, 0.2],
-        },
-        {"metric": ["manhattan"], "shrink_threshold": [None]},
-    ]
-    return run_competitor_grid(
-        "NearestCentroid",
-        parameter_grid,
-        X_train,
-        y_train,
-        seed,
-        args.competitor_cv_folds,
-        args.competitor_selection_metric,
-    )
-
-
-def tune_radius_neighbors(X_train, y_train, seed, args):
-    parameter_grid = {
-        "radius": [0.5, 1.0, 2.0],
-        "weights": ["uniform", "distance"],
-        "p": [1, 2],
-    }
-    return run_competitor_grid(
-        "RadiusNeighbors",
-        parameter_grid,
-        X_train,
-        y_train,
-        seed,
-        args.competitor_cv_folds,
-        args.competitor_selection_metric,
-    )
-
-
-def tune_nusvc(X_train, y_train, seed, args):
-    parameter_grid = {
-        "nu": [0.1, 0.2],
-        "gamma": ["scale", "auto"],
-    }
-    return run_competitor_grid(
-        "NuSVC",
-        parameter_grid,
-        X_train,
-        y_train,
-        seed,
-        args.competitor_cv_folds,
-        args.competitor_selection_metric,
-    )
-
-
-def tune_sgd(X_train, y_train, seed, args):
-    parameter_grid = {
-        "loss": ["log_loss", "modified_huber"],
-        "alpha": [1e-4, 1e-3, 1e-2],
-        "penalty": ["l2"],
-    }
-    return run_competitor_grid(
-        "SGD",
-        parameter_grid,
-        X_train,
-        y_train,
-        seed,
-        args.competitor_cv_folds,
-        args.competitor_selection_metric,
-    )
-
-
-COMPETITOR_TUNERS = {
-    "kNFST": tune_knfst,
-    "LDA": tune_lda,
-    "GaussianNB": tune_gaussian_nb,
-    "KNeighbors": tune_kneighbors,
-    "NearestCentroid": tune_nearest_centroid,
-    "RadiusNeighbors": tune_radius_neighbors,
-    "NuSVC": tune_nusvc,
-    "SGD": tune_sgd,
-}
+    if model_name == "NuSVC":
+        return NuSVC(nu=0.2, kernel="rbf", random_state=seed)
+    if model_name == "SGD":
+        return SGDClassifier(
+            loss="log_loss",
+            max_iter=1000,
+            tol=1e-3,
+            random_state=seed,
+        )
+    raise ValueError(f"Unknown model: {model_name}")
 
 
 def align_class_columns(values, source_labels, labels, fill_value):
@@ -1264,16 +986,8 @@ def main():
 
     if args.output_dir is None:
         result_root = WORKSPACE_ROOT / "results" / "models-compare"
-        competitor_grid_name = (
-            "competitor-grid="
-            f"cv{args.competitor_cv_folds}"
-            f"__metric={args.competitor_selection_metric}"
-            if args.competitor_grid
-            else "competitor-grid=off"
-        )
         experiment_folder = (
             f"{parameter_name}__normalization={args.normalization_mode}"
-            f"__{competitor_grid_name}"
         )
         output_dir = (
             result_root
@@ -1314,15 +1028,6 @@ def main():
             "normalization_mode": args.normalization_mode,
             "lim_parameter_mode": args.lim_parameter_mode,
             "best_parameter_source": args.best_parameter_source,
-            "competitor_grid_enabled": args.competitor_grid,
-            "competitor_cv_folds": args.competitor_cv_folds,
-            "competitor_selection_metric": (
-                args.competitor_selection_metric
-            ),
-            "competitor_grid_protocol": (
-                "StratifiedKFold on each outer training split; outer test "
-                "is untouched."
-            ),
             "single_sample_repeats": args.single_sample_repeats,
             "single_sample_warmup": args.single_sample_warmup,
             "create_plots": args.create_plots,
@@ -1347,10 +1052,6 @@ def main():
     print(f"Models     : {model_names}")
     print(f"Seeds      : {seeds}")
     print(f"Best source: {args.best_parameter_source}")
-    print(
-        "Competitor grid: "
-        f"{'on' if args.competitor_grid else 'off'}"
-    )
     print(f"Output     : {output_dir.resolve()}")
 
     primary_lim_model = (
@@ -1365,8 +1066,6 @@ def main():
     score_methods = {}
     pooled_predictions = {}
     saved_models = {}
-    competitor_grid_rows = []
-    competitor_best_rows = []
 
     for dataset in datasets:
         parameters = parameters_by_dataset[dataset]
@@ -1423,52 +1122,6 @@ def main():
             labels = np.arange(len(encoder.classes_), dtype=np.int64)
             label_names = [str(name) for name in encoder.classes_]
             training_labels = np.unique(y_train)
-            selected_competitor_parameters = {}
-
-            if args.competitor_grid:
-                competitor_models = [
-                    model_name
-                    for model_name in model_names
-                    if model_name in COMPETITOR_MODEL_NAMES
-                ]
-                for model_name in competitor_models:
-                    selected_parameters, best_row, grid_rows = (
-                        COMPETITOR_TUNERS[model_name](
-                            X_train,
-                            y_train,
-                            seed,
-                            args,
-                        )
-                    )
-                    selected_competitor_parameters[model_name] = (
-                        selected_parameters
-                    )
-                    competitor_grid_rows.extend(
-                        {
-                            "dataset": dataset,
-                            "seed": seed,
-                            **grid_row,
-                        }
-                        for grid_row in grid_rows
-                    )
-                    competitor_best_rows.append(
-                        {
-                            "dataset": dataset,
-                            "seed": seed,
-                            "model": model_name,
-                            "parameters_json": best_row["parameters_json"],
-                            "selection_metric": best_row[
-                                "selection_metric"
-                            ],
-                            "validation_score": best_row[
-                                "validation_score"
-                            ],
-                            "validation_score_std": best_row[
-                                "validation_score_std"
-                            ],
-                            "cv_folds": best_row["cv_folds"],
-                        }
-                    )
 
             for model_name in model_names:
                 try:
@@ -1480,7 +1133,6 @@ def main():
                         parameters["epsilon"],
                         parameters["rff_components"],
                         parameters["rff_gamma_multiplier"],
-                        selected_competitor_parameters.get(model_name),
                     )
 
                     fit_started = perf_counter()
@@ -1706,23 +1358,6 @@ def main():
         output_dir / "results.csv",
         index=False,
         float_format="%.8f",
-    )
-
-    pd.DataFrame(
-        competitor_grid_rows,
-        columns=COMPETITOR_GRID_RESULT_COLUMNS,
-    ).to_csv(
-        output_dir / "competitor_grid_results.csv",
-        index=False,
-        float_format="%.10f",
-    )
-    pd.DataFrame(
-        competitor_best_rows,
-        columns=COMPETITOR_BEST_PARAMETER_COLUMNS,
-    ).to_csv(
-        output_dir / "competitor_best_parameters.csv",
-        index=False,
-        float_format="%.10f",
     )
 
     if per_class_runs:
