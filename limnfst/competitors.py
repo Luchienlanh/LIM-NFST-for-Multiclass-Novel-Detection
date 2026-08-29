@@ -66,13 +66,11 @@ def learn_knfst(kernel_matrix, y):
         _, fallback_vectors = np.linalg.eigh(within_scatter)
         eigenvectors = fallback_vectors[:, :1]
 
-    projection = np.asarray(centered_basis @ eigenvectors).real
+    projection = centered_basis @ eigenvectors
     centroids = []
     for class_label in classes:
         class_kernel = kernel_matrix[:, y == class_label]
-        centroids.append(
-            np.asarray(class_kernel.T @ projection).mean(axis=0).ravel()
-        )
+        centroids.append(np.mean(class_kernel.T @ projection, axis=0))
     return projection, np.asarray(centroids).real
 
 
