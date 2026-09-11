@@ -8,6 +8,9 @@ This script requires a CUDA-enabled PyTorch installation and a CUDA GPU.
 For each outer novel class, the grid excludes that class completely. It uses
 only the remaining outer-training classes in an inner LOCO + StratifiedKFold
 selection loop, then saves one best configuration for that outer class.
+Each projection is fitted once per parameter group and CV fold, then reused
+for every neighbor-count and novelty-quantile combination in that group.
+Use --resume with the same output directory to reuse completed group folds.
 """
 
 from __future__ import annotations
@@ -17,8 +20,10 @@ import hashlib
 import json
 import os
 import sys
+from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 try:
     import torch
@@ -31,6 +36,7 @@ except (ImportError, OSError) as error:
 
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.impute import SimpleImputer
 from sklearn.kernel_approximation import RBFSampler
 from sklearn.metrics import (
@@ -310,7 +316,6 @@ class LIM_NFST:
             self.X_reference_
         )
         self.reference_points_ = []
-        thresholds = []
         for class_label in self.classes_:
             class_mask = torch.as_tensor(
                 reference_labels == class_label, device=self.device_
@@ -321,8 +326,23 @@ class LIM_NFST:
                     f"Class {class_label!r} needs at least two reference samples."
                 )
             self.reference_points_.append(reference_points)
-            thresholds.append(self._calculate_reference_threshold(reference_points))
-        self.reference_thresholds_ = torch.stack(thresholds)
+        return self.set_detection_parameters(
+            self.number_of_neighbors, self.novelty_quantile
+        )
+
+    @torch.no_grad()
+    def set_detection_parameters(self, number_of_neighbors, novelty_quantile):
+        """Recalibrate detection without refitting RFF or the LIM projection."""
+        if self.projection_matrix_ is None:
+            raise RuntimeError("Fit the model before calibrating detection.")
+        self.number_of_neighbors = int(number_of_neighbors)
+        self.novelty_quantile = float(novelty_quantile)
+        self.reference_thresholds_ = torch.stack(
+            [
+                self._calculate_reference_threshold(reference_points)
+                for reference_points in self.reference_points_
+            ]
+        )
         return self
 
     def _project_model_features(self, features):
@@ -436,11 +456,37 @@ def number_to_name(value: float) -> str:
     return format(float(value), ".6g").replace(".", "p")
 
 
+@contextmanager
+def atomic_text_file(path: Path):
+    """Replace a file only after its complete contents have been flushed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            yield stream
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
 def save_json(path: Path, data: object) -> None:
-    path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
+    with atomic_text_file(path) as stream:
+        json.dump(data, stream, indent=2, ensure_ascii=False, default=str)
+
+def save_csv(path: Path, dataframe: pd.DataFrame) -> None:
+    with atomic_text_file(path) as stream:
+        dataframe.to_csv(stream, index=False, float_format="%.8f")
 
 
 def parse_args() -> argparse.Namespace:
@@ -448,6 +494,11 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate or tune RFF-REF-LIM for MND/LOCO on a CUDA GPU."
     )
     parser.add_argument("--grid-search", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume grid search from compatible checkpoints in --output-dir.",
+    )
     parser.add_argument("--dataset", choices=DATASETS, default="BoT_IoT")
     parser.add_argument("--all-datasets", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
@@ -516,7 +567,10 @@ def parse_args() -> argparse.Namespace:
         default="novel_detection_f1",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.resume and not args.grid_search:
+        parser.error("--resume is only supported with --grid-search.")
+    return args
 
 
 def get_datasets_and_seeds(
@@ -900,6 +954,20 @@ def grid_configurations(args: argparse.Namespace) -> list[dict[str, object]]:
     ]
 
 
+def group_projection_configurations(
+    configurations: list[dict[str, object]],
+) -> list[list[dict[str, object]]]:
+    """Group configurations that differ only in detection parameters."""
+    groups = {}
+    for configuration in configurations:
+        projection_key = tuple(
+            (name, value)
+            for name, value in sorted(configuration.items())
+            if name not in {"neighbors", "novelty_quantile"}
+        )
+        groups.setdefault(projection_key, []).append(configuration)
+    return list(groups.values())
+
 def configuration_name(configuration: dict[str, object]) -> str:
     return (
         f"scaler={configuration['scaler']}"
@@ -1096,38 +1164,171 @@ def save_grid_manifest(
     seeds: list[int],
     configurations: list[dict[str, object]],
     version: str,
-) -> None:
-    save_json(
-        output_dir / "grid_parameters.json",
-        {
-            "mode": "RFF-REF-LIM MND strict nested LOCO grid search",
-            "lim_code_version": version,
-            "datasets": datasets,
-            "seeds": seeds,
-            "limit_override": args.limit,
-            "test_size": TEST_SIZE,
-            "use_rff": True,
-            "scalers": args.grid_scalers,
-            "reference_sizes": args.grid_reference_sizes,
-            "neighbors": args.grid_neighbors,
-            "epsilon": args.epsilon,
-            "rff_components": args.grid_rff_components,
-            "rff_gamma_mode": "scale_times_multiplier",
-            "rff_gamma_multipliers": args.grid_rff_gamma_multipliers,
-            "threshold_mode": "reference_cloud_quantile",
-            "novelty_quantiles": args.grid_novelty_quantiles,
-            "selection_metric": args.selection_metric,
-            "cross_validation": "strict_nested_LOCO_StratifiedKFold",
-            "cv_folds": args.cv_folds,
-            "cv_repeats": len(seeds),
-            "configurations_per_outer_novel_class": len(configurations),
-            "outer_test_used_for_selection": False,
-            "outer_novel_class_excluded_from_all_grid_selection": True,
-            "mnd_selection_protocol": (
-                "outer_novel_class_excluded_from_all_grid_selection"
-            ),
+) -> str:
+    manifest = {
+        "mode": "RFF-REF-LIM MND strict nested LOCO grid search",
+        "lim_code_version": version,
+        "datasets": datasets,
+        "seeds": seeds,
+        "limit_override": args.limit,
+        "test_size": TEST_SIZE,
+        "use_rff": True,
+        "scalers": args.grid_scalers,
+        "reference_sizes": args.grid_reference_sizes,
+        "neighbors": args.grid_neighbors,
+        "epsilon": args.epsilon,
+        "rff_components": args.grid_rff_components,
+        "rff_gamma_mode": "scale_times_multiplier",
+        "rff_gamma_multipliers": args.grid_rff_gamma_multipliers,
+        "threshold_mode": "reference_cloud_quantile",
+        "novelty_quantiles": args.grid_novelty_quantiles,
+        "selection_metric": args.selection_metric,
+        "cross_validation": "strict_nested_LOCO_StratifiedKFold",
+        "cv_folds": args.cv_folds,
+        "cv_repeats": len(seeds),
+        "configurations_per_outer_novel_class": len(configurations),
+        "outer_test_used_for_selection": False,
+        "outer_novel_class_excluded_from_all_grid_selection": True,
+        "mnd_selection_protocol": (
+            "outer_novel_class_excluded_from_all_grid_selection"
+        ),
+        "checkpoint_format_version": 1,
+        "metric_columns": METRIC_COLUMNS,
+        "novel_class": (
+            None if args.novel_class is None else str(args.novel_class)
+        ),
+        "dataset_limits": {
+            dataset: args.limit or DEFAULT_LIMITS[dataset]
+            for dataset in datasets
         },
+        "libraries": {
+            "torch": torch.__version__,
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "scikit_learn": sklearn.__version__,
+            "model_dtype": "float64",
+        },
+    }
+    manifest_path = output_dir / "grid_parameters.json"
+    if manifest_path.exists():
+        if not args.resume:
+            raise FileExistsError(
+                f"Grid results already exist in {output_dir}. "
+                "Use --resume or choose a new --output-dir."
+            )
+        saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if saved_manifest != manifest:
+            raise ValueError(
+                "Cannot resume: the code, libraries, metric schema or grid "
+                "arguments differ from grid_parameters.json. Older runs "
+                "without checkpoints cannot be resumed automatically. "
+                "Restore the original run environment or use a new --output-dir."
+            )
+    else:
+        if any(output_dir.iterdir()):
+            raise FileExistsError(
+                f"{output_dir} is not empty and has no grid_parameters.json. "
+                "Choose a new --output-dir; existing files will not be overwritten."
+            )
+        save_json(manifest_path, manifest)
+    return hashlib.sha256(
+        json.dumps(manifest, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+def validate_grid_dataset(
+    output_dir: Path,
+    dataset: str,
+    dataframe: pd.DataFrame,
+    run_signature: str,
+) -> str:
+    """Reject changed data, including changed row order, before resuming."""
+    features, labels = raw_dataset_arrays(dataframe)
+    data_hash = hashlib.sha256(features.tobytes(order="C"))
+    data_hash.update(
+        json.dumps(
+            {
+                "columns": [str(column) for column in dataframe.columns],
+                "shape": features.shape,
+                "labels": labels.tolist(),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
     )
+    fingerprint = data_hash.hexdigest()
+    fingerprints_path = output_dir / "dataset_fingerprints.json"
+    fingerprints = (
+        json.loads(fingerprints_path.read_text(encoding="utf-8"))
+        if fingerprints_path.exists()
+        else {}
+    )
+    if not isinstance(fingerprints, dict):
+        raise ValueError(f"Invalid dataset fingerprints: {fingerprints_path}")
+    if dataset in fingerprints and fingerprints[dataset] != fingerprint:
+        raise ValueError(
+            f"Cannot resume {dataset}: the loaded data differs from this run. "
+            "Restore the original data or use a new --output-dir."
+        )
+    if dataset not in fingerprints:
+        fingerprints[dataset] = fingerprint
+        save_json(fingerprints_path, fingerprints)
+    return hashlib.sha256(
+        f"{run_signature}:{fingerprint}".encode("utf-8")
+    ).hexdigest()
+
+def load_grid_checkpoint(
+    path: Path,
+    context: dict[str, object],
+) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        print(f"Invalid checkpoint {path}; recomputing this group fold.", flush=True)
+        return None
+    if (
+        isinstance(checkpoint, dict)
+        and "context" in checkpoint
+        and checkpoint["context"] != context
+    ):
+        raise ValueError(
+            f"Checkpoint context mismatch: {path}. "
+            "Use the original run settings or a new --output-dir."
+        )
+    try:
+        gamma = checkpoint["rff_gamma"]
+        evaluations = checkpoint["evaluations"]
+        valid = (
+            checkpoint.get("context") == context
+            and type(gamma) in (int, float)
+            and np.isfinite(gamma)
+            and gamma > 0.0
+            and isinstance(evaluations, list)
+            and len(evaluations) == len(context["configurations"])
+            and all(
+                isinstance(rows, list)
+                and len(rows) == 3
+                and all(
+                    isinstance(row, dict)
+                    and set(row) == {"test_set", *METRIC_COLUMNS}
+                    and row["test_set"] == test_set
+                    and all(
+                        type(row[metric]) in (int, float)
+                        and np.isfinite(row[metric])
+                        for metric in METRIC_COLUMNS
+                    )
+                    for row, test_set in zip(rows, ("known", "novel", "combined"))
+                )
+                for rows in evaluations
+            )
+        )
+    except (KeyError, TypeError):
+        valid = False
+    if not valid:
+        print(f"Incomplete checkpoint {path}; recomputing this group fold.", flush=True)
+        return None
+    return checkpoint
 
 
 def prepare_grid_fold_cache(
@@ -1157,44 +1358,113 @@ def prepare_grid_fold_cache(
     return fold_cache
 
 
-def evaluate_grid_configuration(
+def evaluate_grid_projection_group(
     dataset: str,
     outer_novel_class: object,
-    configuration: dict[str, object],
+    configurations: list[dict[str, object]],
     fold_cache: dict[tuple[int, str], list[dict[str, object]]],
-) -> tuple[list[dict[str, object]], dict[str, float]]:
-    model_name = f"{MODEL_NAME}[{configuration_name(configuration)}]"
-    run_rows = []
-    gamma_by_run = {}
+    output_dir: Path,
+    run_signature: str,
+) -> list[
+    tuple[dict[str, object], list[dict[str, object]], dict[str, float]]
+]:
+    configuration_runs = [
+        (configuration, [], {}) for configuration in configurations
+    ]
+    projection_id = configuration_id(
+        {
+            name: value
+            for name, value in configurations[0].items()
+            if name not in {"neighbors", "novelty_quantile"}
+        }
+    )
+    outer_id = configuration_id(
+        {"dataset": dataset, "outer_novel_class": str(outer_novel_class)}
+    )
+    checkpoint_dir = output_dir / ".checkpoints" / outer_id / projection_id
+    resumed_folds = 0
     for (seed, inner_novel_class), folds in fold_cache.items():
         for fold_data in folds:
-            evaluation_rows, rff_gamma = evaluate_configuration(
-                configuration,
-                seed,
-                fold_data["X_train"],
-                fold_data["y_train"],
-                fold_data["X_known_test"],
-                fold_data["y_known_test"],
-                fold_data["X_novel_test"],
+            fold_identity = {
+                "seed": seed,
+                "inner_novel_class": inner_novel_class,
+                "fold": fold_data["fold"],
+            }
+            context = {
+                "run_signature": run_signature,
+                "dataset": dataset,
+                "outer_novel_class": str(outer_novel_class),
+                "configurations": configurations,
+                **fold_identity,
+            }
+            checkpoint_path = checkpoint_dir / (
+                f"{configuration_id(fold_identity)}.json"
             )
-            for row in evaluation_rows:
-                run_rows.append(
-                    {
-                        "dataset": dataset,
-                        "model": model_name,
-                        "outer_novel_class": str(outer_novel_class),
-                        "inner_novel_class": inner_novel_class,
-                        "seed": seed,
-                        "fold": fold_data["fold"],
-                        **row,
-                    }
+            checkpoint = load_grid_checkpoint(checkpoint_path, context)
+            if checkpoint is None:
+                model = make_model(configurations[0], seed).fit(
+                    fold_data["X_train"], fold_data["y_train"]
                 )
-            gamma_by_run[
-                "seed="
-                f"{seed}__inner_novel_class={inner_novel_class}"
-                f"__fold={fold_data['fold']}"
-            ] = rff_gamma
-    return run_rows, gamma_by_run
+                rff_gamma = float(model.rff_gamma_)
+                evaluations = []
+                for configuration_index, configuration in enumerate(
+                    configurations
+                ):
+                    if configuration_index:
+                        model.set_detection_parameters(
+                            configuration["neighbors"],
+                            configuration["novelty_quantile"],
+                        )
+                    evaluations.append(
+                        evaluate_model(
+                            model,
+                            fold_data["X_known_test"],
+                            fold_data["y_known_test"],
+                            fold_data["X_novel_test"],
+                        )
+                    )
+                del model
+                save_json(
+                    checkpoint_path,
+                    {
+                        "context": context,
+                        "rff_gamma": rff_gamma,
+                        "evaluations": evaluations,
+                    },
+                )
+            else:
+                resumed_folds += 1
+                rff_gamma = checkpoint["rff_gamma"]
+                evaluations = checkpoint["evaluations"]
+            for (configuration, run_rows, gamma_by_run), evaluation_rows in zip(
+                configuration_runs, evaluations
+            ):
+                model_name = f"{MODEL_NAME}[{configuration_name(configuration)}]"
+                for row in evaluation_rows:
+                    run_rows.append(
+                        {
+                            "dataset": dataset,
+                            "model": model_name,
+                            "outer_novel_class": str(outer_novel_class),
+                            "inner_novel_class": inner_novel_class,
+                            "seed": seed,
+                            "fold": fold_data["fold"],
+                            **row,
+                        }
+                    )
+                gamma_by_run[
+                    "seed="
+                    f"{seed}__inner_novel_class={inner_novel_class}"
+                    f"__fold={fold_data['fold']}"
+                ] = rff_gamma
+    if resumed_folds:
+        print(
+            f"Resumed dataset={dataset} outer_novel_class={outer_novel_class} "
+            f"projection={projection_id} "
+            f"folds={resumed_folds}/{sum(map(len, fold_cache.values()))}",
+            flush=True,
+        )
+    return configuration_runs
 
 
 def save_configuration_artifacts(
@@ -1234,11 +1504,7 @@ def save_configuration_artifacts(
             **configuration,
         },
     )
-    run_frame.to_csv(
-        configuration_dir / "cv_results.csv",
-        index=False,
-        float_format="%.8f",
-    )
+    save_csv(configuration_dir / "cv_results.csv", run_frame)
     summary = (
         run_frame.groupby("test_set", sort=False)[METRIC_COLUMNS]
         .agg(["mean", "std"])
@@ -1251,11 +1517,7 @@ def save_configuration_artifacts(
     summary.insert(0, "model", f"{MODEL_NAME}[{configuration_name(configuration)}]")
     summary.insert(0, "outer_novel_class", str(outer_novel_class))
     summary.insert(0, "dataset", dataset)
-    summary.to_csv(
-        configuration_dir / "cv_summary.csv",
-        index=False,
-        float_format="%.8f",
-    )
+    save_csv(configuration_dir / "cv_summary.csv", summary)
     save_json(configuration_dir / "rff_gamma_by_cv_run.json", gamma_by_run)
 
 
@@ -1371,7 +1633,7 @@ def run_grid_search(
     }
     output_dir = grid_output_dir(args, version)
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_grid_manifest(
+    run_signature = save_grid_manifest(
         output_dir,
         args,
         datasets,
@@ -1393,6 +1655,9 @@ def run_grid_search(
             args.limit or DEFAULT_LIMITS[dataset]
         )
         dataframe, _ = load_dataset(dataset, limit)
+        dataset_signature = validate_grid_dataset(
+            output_dir, dataset, dataframe, run_signature
+        )
         outer_novel_classes = resolve_novel_classes(dataframe, args.novel_class)
         novel_classes_by_dataset[dataset] = [
             str(label) for label in outer_novel_classes
@@ -1408,56 +1673,67 @@ def run_grid_search(
                     seeds,
                     args.cv_folds,
                 )
-                for configuration in scaler_configurations:
-                    configuration_index += 1
-                    if (
-                        configuration_index == 1
-                        or configuration_index % 100 == 0
-                        or configuration_index == len(configurations)
-                    ):
+                for projection_group in group_projection_configurations(
+                    scaler_configurations
+                ):
+                    if configuration_index == 0:
                         report_grid_progress(
                             dataset,
                             outer_novel_class,
-                            configuration_index,
+                            1,
                             len(configurations),
                         )
-                    run_rows, gamma_by_run = evaluate_grid_configuration(
+                    group_runs = evaluate_grid_projection_group(
                         dataset,
                         outer_novel_class,
-                        configuration,
+                        projection_group,
                         fold_cache,
-                    )
-                    run_frame = pd.DataFrame(
-                        run_rows,
-                        columns=GRID_RUN_COLUMNS,
-                    )
-                    save_configuration_artifacts(
                         output_dir,
-                        dataset,
-                        outer_novel_class,
-                        configuration,
-                        run_frame,
-                        gamma_by_run,
-                        args,
-                        version,
+                        dataset_signature,
                     )
-                    grid_result_rows.extend(
-                        summarize_grid_runs(
-                            run_frame,
-                            dataset,
-                            outer_novel_class,
-                            configuration,
-                        ).to_dict("records")
-                    )
-                    candidates.append(
-                        candidate_from_runs(
-                            dataset,
-                            outer_novel_class,
-                            configuration,
-                            run_frame,
-                            args.selection_metric,
+                    for configuration, run_rows, gamma_by_run in group_runs:
+                        configuration_index += 1
+                        if configuration_index != 1 and (
+                            configuration_index % 100 == 0
+                            or configuration_index == len(configurations)
+                        ):
+                            report_grid_progress(
+                                dataset,
+                                outer_novel_class,
+                                configuration_index,
+                                len(configurations),
+                            )
+                        run_frame = pd.DataFrame(
+                            run_rows,
+                            columns=GRID_RUN_COLUMNS,
                         )
-                    )
+                        save_configuration_artifacts(
+                            output_dir,
+                            dataset,
+                            outer_novel_class,
+                            configuration,
+                            run_frame,
+                            gamma_by_run,
+                            args,
+                            version,
+                        )
+                        grid_result_rows.extend(
+                            summarize_grid_runs(
+                                run_frame,
+                                dataset,
+                                outer_novel_class,
+                                configuration,
+                            ).to_dict("records")
+                        )
+                        candidates.append(
+                            candidate_from_runs(
+                                dataset,
+                                outer_novel_class,
+                                configuration,
+                                run_frame,
+                                args.selection_metric,
+                            )
+                        )
             print(
                 f"Completed dataset={dataset} "
                 f"outer_novel_class={outer_novel_class} "
@@ -1466,17 +1742,9 @@ def run_grid_search(
             )
 
     grid_results = pd.DataFrame(grid_result_rows, columns=GRID_RESULT_COLUMNS)
-    grid_results.to_csv(
-        output_dir / "grid_search_results.csv",
-        index=False,
-        float_format="%.8f",
-    )
+    save_csv(output_dir / "grid_search_results.csv", grid_results)
     candidate_frame = pd.DataFrame(candidates, columns=CANDIDATE_COLUMNS)
-    candidate_frame.to_csv(
-        output_dir / "grid_candidates.csv",
-        index=False,
-        float_format="%.8f",
-    )
+    save_csv(output_dir / "grid_candidates.csv", candidate_frame)
     best_parameters = select_best_parameters(
         candidate_frame,
         args.selection_metric,
@@ -1484,11 +1752,7 @@ def run_grid_search(
         len(seeds),
         version,
     )
-    best_parameters.to_csv(
-        output_dir / "best_parameters.csv",
-        index=False,
-        float_format="%.8f",
-    )
+    save_csv(output_dir / "best_parameters.csv", best_parameters)
     save_json(output_dir / "novel_classes.json", novel_classes_by_dataset)
 
     print(f"Output: {output_dir.resolve()}")
